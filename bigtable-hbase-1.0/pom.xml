@@ -170,6 +170,10 @@ limitations under the License.
                                     <shadedPattern>com.google.bigtable.repackaged.com.google.protobuf</shadedPattern>
                                 </relocation>
                                 <relocation>
+                                    <pattern>io.grpc</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.io.grpc</shadedPattern>
+                                </relocation>
+                                <relocation>
                                     <pattern>com.fasterxml</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.com.fasterxml</shadedPattern>
                                 </relocation>
