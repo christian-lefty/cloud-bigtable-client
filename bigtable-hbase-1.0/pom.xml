@@ -184,6 +184,7 @@ limitations under the License.
                                 <relocation>
                                     <pattern>com.fasterxml</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.com.fasterxml</shadedPattern>
+                                </relocation>
                                 <relocation>
                                     <pattern>com.twitter</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.com.twitter</shadedPattern>
