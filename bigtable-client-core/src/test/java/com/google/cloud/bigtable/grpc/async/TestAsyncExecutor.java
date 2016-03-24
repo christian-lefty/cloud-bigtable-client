@@ -18,7 +18,6 @@ package com.google.cloud.bigtable.grpc.async;
 import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.when;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -61,16 +60,16 @@ public class TestAsyncExecutor {
   private ListenableFuture future;
 
   private AsyncExecutor underTest;
-  private HeapSizeManager heapSizeManager;
+  private RpcThrottler rpcThrottler;
   private List<FutureCallback<?>> callbacks;
 
   @Before
   public void setUp() {
     MockitoAnnotations.initMocks(this);
     callbacks = new ArrayList<>();
-    heapSizeManager = new HeapSizeManager(1000, 10){
+    rpcThrottler = new RpcThrottler(new ResourceLimiter(1000, 10)) {
       @Override
-      public <T> FutureCallback<T> addCallback(ListenableFuture<T> future, Long id) {
+      public <T> FutureCallback<T> addCallback(ListenableFuture<T> future, long id) {
         FutureCallback<T> callback = super.addCallback(future, id);
         synchronized (callbacks) {
           callbacks.add(callback);
@@ -79,16 +78,16 @@ public class TestAsyncExecutor {
       }
     };
 
-    underTest = new AsyncExecutor(client, heapSizeManager);
+    underTest = new AsyncExecutor(client, rpcThrottler);
   }
 
   @Test
-  public void testNoMutation() throws IOException {
+  public void testNoMutation() {
     Assert.assertFalse(underTest.hasInflightRequests());
   }
 
   @Test
-  public void testMutation() throws IOException, InterruptedException {
+  public void testMutation() throws InterruptedException {
     when(client.mutateRowAsync(any(MutateRowRequest.class))).thenReturn(future);
     underTest.mutateRowAsync(MutateRowRequest.getDefaultInstance());
     Assert.assertTrue(underTest.hasInflightRequests());
@@ -97,7 +96,7 @@ public class TestAsyncExecutor {
   }
 
   @Test
-  public void testCheckAndMutate() throws IOException, InterruptedException {
+  public void testCheckAndMutate() throws InterruptedException {
     when(client.checkAndMutateRowAsync(any(CheckAndMutateRowRequest.class))).thenReturn(future);
     underTest.checkAndMutateRowAsync(CheckAndMutateRowRequest.getDefaultInstance());
     Assert.assertTrue(underTest.hasInflightRequests());
@@ -106,7 +105,7 @@ public class TestAsyncExecutor {
   }
 
   @Test
-  public void testReadWriteModify() throws IOException, InterruptedException {
+  public void testReadWriteModify() throws InterruptedException {
     when(client.readModifyWriteRowAsync(any(ReadModifyWriteRowRequest.class))).thenReturn(future);
     underTest.readModifyWriteRowAsync(ReadModifyWriteRowRequest.getDefaultInstance());
     Assert.assertTrue(underTest.hasInflightRequests());
@@ -115,7 +114,7 @@ public class TestAsyncExecutor {
   }
 
   @Test
-  public void testReadRowsAsync() throws IOException, InterruptedException {
+  public void testReadRowsAsync() throws InterruptedException {
     when(client.readRowsAsync(any(ReadRowsRequest.class))).thenReturn(future);
     underTest.readRowsAsync(ReadRowsRequest.getDefaultInstance());
     Assert.assertTrue(underTest.hasInflightRequests());
@@ -137,7 +136,7 @@ public class TestAsyncExecutor {
   @Test
   /**
    * Tests to make sure that mutateRowAsync will perform a wait() if there is a bigger count of RPCs
-   * than the maximum of the HeapSizeManager.
+   * than the maximum of the RpcThrottler.
    */
   public void testRegisterWaitsAfterCountLimit() throws Exception {
     ExecutorService testExecutor = Executors.newCachedThreadPool();
@@ -169,7 +168,7 @@ public class TestAsyncExecutor {
   @Test
   /**
    * Tests to make sure that mutateRowAsync will perform a wait() if there is a bigger accumulated
-   * serialized size of RPCs than the maximum of the HeapSizeManager.
+   * serialized size of RPCs than the maximum of the RpcThrottler.
    */
   public void testRegisterWaitsAfterSizeLimit() throws Exception {
     ExecutorService testExecutor = Executors.newCachedThreadPool();

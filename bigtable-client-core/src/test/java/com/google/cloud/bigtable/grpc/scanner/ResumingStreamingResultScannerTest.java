@@ -24,16 +24,14 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.mock;
 
 import com.google.bigtable.v1.ReadRowsRequest;
 import com.google.bigtable.v1.Row;
+import com.google.bigtable.v1.RowRange;
 import com.google.cloud.bigtable.config.Logger;
 import com.google.cloud.bigtable.config.RetryOptions;
 import com.google.cloud.bigtable.grpc.io.IOExceptionWithStatus;
-import com.google.cloud.bigtable.grpc.scanner.BigtableResultScannerFactory;
-import com.google.cloud.bigtable.grpc.scanner.ScanTimeoutException;
-import com.google.cloud.bigtable.grpc.scanner.ResultScanner;
-import com.google.cloud.bigtable.grpc.scanner.ResumingStreamingResultScanner;
 import com.google.protobuf.ByteString;
 
 import org.junit.Before;
@@ -44,11 +42,13 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
+import org.mockito.stubbing.OngoingStubbing;
 
 import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Test for the {@link ResumingStreamingResultScanner}
@@ -67,8 +67,13 @@ public class ResumingStreamingResultScannerTest {
   @Mock
   Logger logger;
 
+  private static final int MAX_SCAN_TIMEOUT_RETRIES = 3;
+
   RetryOptions retryOptions;
-  ReadRowsRequest readRowsRequest = ReadRowsRequest.getDefaultInstance();
+  ByteString blank = ByteString.copyFrom(new byte[0]);
+  ReadRowsRequest readRowsRequest = ReadRowsRequest.newBuilder()
+      .setRowRange(RowRange.newBuilder().setStartKey(blank).setEndKey(blank).build())
+      .build();
 
   @Before
   public void setup() {
@@ -127,22 +132,33 @@ public class ResumingStreamingResultScannerTest {
   @Test
   public void testAbortedErrorsResumeWithRowLimit() throws IOException {
     doErrorsResume(
-        new IOExceptionWithStatus("Test", new StatusRuntimeException(Status.ABORTED)), 10);
+        new IOExceptionWithStatus("Test", Status.ABORTED), 10);
   }
 
   @Test
   public void testAbortedErrorsResumeWithTooManyRowsReturned() throws IOException {
     doErrorsResume(
-        new IOExceptionWithStatus("Test", new StatusRuntimeException(Status.ABORTED)), 1);
+        new IOExceptionWithStatus("Test", Status.ABORTED), 1);
   }
 
   private void doErrorsResume(Status status) throws IOException {
-    doErrorsResume(new IOExceptionWithStatus("Test", new StatusRuntimeException(status)));
+    doErrorsResume(new IOExceptionWithStatus("Test", status));
   }
 
   @Test
   public void testReadTimeoutResume() throws IOException {
     doErrorsResume(new ScanTimeoutException("ReadTimeoutTest"));
+  }
+
+  @Test
+  public void testMultipleReadTimeoutResume() throws IOException {
+    doErrorsResume(new ScanTimeoutException("ReadTimeoutTest"), 0, MAX_SCAN_TIMEOUT_RETRIES);
+  }
+
+  @Test
+  public void testMultipleReadTimeoutResumeAndExhaust() throws IOException {
+    doErrorsResumeAndExhaust(
+        new ScanTimeoutException("ReadTimeoutTest"), 0, MAX_SCAN_TIMEOUT_RETRIES + 1);
   }
 
   private void doErrorsResume(IOException expectedIOException) throws IOException {
@@ -151,12 +167,20 @@ public class ResumingStreamingResultScannerTest {
 
   private void doErrorsResume(IOException expectedIOException, long numRowsLimit)
       throws IOException {
+    doErrorsResume(expectedIOException, numRowsLimit, 1);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void doErrorsResume(IOException expectedIOException, long numRowsLimit, int numExceptions)
+      throws IOException {
     Row row1 = buildRow("row1");
     Row row2 = buildRow("row2");
     Row row3 = buildRow("row3");
     Row row4 = buildRow("row4");
 
     ReadRowsRequest.Builder originalRequest = readRowsRequest.toBuilder();
+    ByteString blank = ByteString.copyFrom(new byte[0]);
+    originalRequest.setRowRange(RowRange.newBuilder().setStartKey(blank).setEndKey(blank).build());
     if (numRowsLimit != 0) {
       originalRequest.setNumRowsLimit(numRowsLimit);
     }
@@ -168,10 +192,20 @@ public class ResumingStreamingResultScannerTest {
       expectedResumeRequest.setNumRowsLimit(numRowsLimit - 2);
     }
 
-    when(mockScannerFactory.createScanner(eq(originalRequest.build())))
-        .thenReturn(mockScanner);
-    when(mockScannerFactory.createScanner(eq(expectedResumeRequest.build())))
-        .thenReturn(mockScannerPostResume);
+    // If we are doing more than one failure then create a scanner for each.
+    List<ResultScanner<Row>> additionalMockScanners = new ArrayList<>();
+    for (int i = 1; i < numExceptions; i++) {
+      ResultScanner<Row> mock = mock(ResultScanner.class);
+      additionalMockScanners.add(mock);
+    }
+
+    when(mockScannerFactory.createScanner(eq(originalRequest.build()))).thenReturn(mockScanner);
+    OngoingStubbing<ResultScanner<Row>> afterFailureStub =
+        when(mockScannerFactory.createScanner(eq(expectedResumeRequest.build())));
+    for (ResultScanner<Row> mock : additionalMockScanners) {
+      afterFailureStub = afterFailureStub.thenReturn(mock);
+    }
+    afterFailureStub.thenReturn(mockScannerPostResume);
 
     ResumingStreamingResultScanner scanner = new ResumingStreamingResultScanner(
         retryOptions, originalRequest.build(), mockScannerFactory, logger);
@@ -185,6 +219,16 @@ public class ResumingStreamingResultScannerTest {
                 "Next invoked on scanner post-exception. This is most "
                     + "likely due to the mockClient not returning the "
                     + "post-resume scanner properly"));
+
+    for (ResultScanner<Row> mock : additionalMockScanners) {
+      when(mock.next())
+          .thenThrow(expectedIOException)
+          .thenThrow(
+              new IOException(
+                  "Next invoked on scanner post-exception. This is most "
+                      + "likely due to the mockClient not returning the "
+                      + "post-resume scanner properly"));
+    }
 
     when(mockScannerPostResume.next())
         .thenReturn(row3)
@@ -202,9 +246,15 @@ public class ResumingStreamingResultScannerTest {
     verify(mockScannerFactory, times(1)).createScanner(eq(originalRequest.build()));
     verify(mockScanner, times(1)).close();
     if (numRowsLimit != 1 && numRowsLimit != 2) {
-      verify(mockScannerFactory, times(1)).createScanner(eq(expectedResumeRequest.build()));
+      verify(mockScannerFactory, times(numExceptions)).createScanner(eq(expectedResumeRequest.build()));
     }
     scanner.close();
+  }
+
+  private void doErrorsResumeAndExhaust(IOException expectedIOException, long numRowsLimit,
+      int numExceptions) throws IOException {
+    thrown.expect(BigtableRetriesExhaustedException.class);
+    doErrorsResume(expectedIOException, numRowsLimit, numExceptions);
   }
 
   @Test
@@ -220,6 +270,7 @@ public class ResumingStreamingResultScannerTest {
         .setInitialBackoffMillis(100)
         .setBackoffMultiplier(2D)
         .setMaxElapsedBackoffMillis(500)
+        .setMaxScanTimeoutRetries(MAX_SCAN_TIMEOUT_RETRIES)
         .build();
     doErrorsDoNotResume(Status.DEADLINE_EXCEEDED);
   }
@@ -245,7 +296,7 @@ public class ResumingStreamingResultScannerTest {
     when(mockScanner.next())
         .thenReturn(row1)
         .thenReturn(row2)
-        .thenThrow(new IOExceptionWithStatus("Test", new StatusRuntimeException(status)));
+        .thenThrow(new IOExceptionWithStatus("Test", status));
 
     assertRowKey("row1", scanner.next());
     assertRowKey("row2", scanner.next());
@@ -259,6 +310,75 @@ public class ResumingStreamingResultScannerTest {
 
     verify(mockScannerFactory, times(1)).createScanner(eq(readRowsRequest));
     verifyNoMoreInteractions(mockScannerPostResume, mockScannerFactory);
+    scanner.close();
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  /**
+   * Test successfully retrying while receiving a mixture of timeouts and retryable exceptions
+   */
+  public void testTimeoutsMixedWithErrors() throws IOException {
+    Row row1 = buildRow("row1");
+    Row row2 = buildRow("row2");
+    Row row3 = buildRow("row3");
+    Row row4 = buildRow("row4");
+
+    IOException retryableException =
+        new IOExceptionWithStatus("Test", Status.UNAVAILABLE);
+    IOException timeoutException = new ScanTimeoutException("Test");
+
+    ReadRowsRequest.Builder originalRequest = readRowsRequest.toBuilder();
+
+   when(mockScannerFactory.createScanner(eq(originalRequest.build())))
+        .thenReturn(mockScanner);
+    ResultScanner<Row> afterError1Mock = mock(ResultScanner.class);
+    ResultScanner<Row> afterTimeoutMock = mock(ResultScanner.class);
+    ResultScanner<Row> afterError2Mock = mock(ResultScanner.class);
+
+    ReadRowsRequest.Builder expectedResumeRequest = originalRequest.build().toBuilder();
+    ByteString startKey = ResumingStreamingResultScanner.nextRowKey(ByteString.copyFromUtf8("row1"));
+    expectedResumeRequest.getRowRangeBuilder().setStartKey(startKey);
+    when(mockScannerFactory.createScanner(eq(expectedResumeRequest.build())))
+        .thenReturn(afterError1Mock, afterTimeoutMock);
+
+    expectedResumeRequest = originalRequest.build().toBuilder();
+    startKey = ResumingStreamingResultScanner.nextRowKey(ByteString.copyFromUtf8("row2"));
+    expectedResumeRequest.getRowRangeBuilder().setStartKey(startKey);
+    when(mockScannerFactory.createScanner(eq(expectedResumeRequest.build())))
+        .thenReturn(afterError2Mock, mockScannerPostResume);
+
+    ResumingStreamingResultScanner scanner = new ResumingStreamingResultScanner(
+        retryOptions, originalRequest.build(), mockScannerFactory, logger);
+
+    when(mockScanner.next())
+        .thenReturn(row1)
+        .thenThrow(retryableException)
+        .thenThrow(
+            new IOException(
+                "Next invoked on scanner post-exception. This is most "
+                    + "likely due to the mockClient not returning the "
+                    + "post-resume scanner properly"));
+
+    when(afterError1Mock.next())
+        .thenThrow(timeoutException);
+    when(afterTimeoutMock.next())
+        .thenReturn(row2)
+        .thenThrow(retryableException);
+    when(afterError2Mock.next())
+        .thenThrow(timeoutException);
+    when(mockScannerPostResume.next())
+        .thenReturn(row3)
+        .thenReturn(row4);
+
+    assertRowKey("row1", scanner.next());
+    assertRowKey("row2", scanner.next());
+    assertRowKey("row3", scanner.next());
+    assertRowKey("row4", scanner.next());
+
+    verify(mockScannerFactory, times(1)).createScanner(eq(originalRequest.build()));
+    verify(mockScanner, times(1)).close();
+    verify(mockScannerFactory, times(2)).createScanner(eq(expectedResumeRequest.build()));
     scanner.close();
   }
 }

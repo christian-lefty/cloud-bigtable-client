@@ -15,79 +15,123 @@
  */
 package com.google.cloud.bigtable.grpc.io;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Logger;
+import java.util.concurrent.atomic.AtomicReference;
 
-import com.google.common.annotations.VisibleForTesting;
+import com.google.cloud.bigtable.config.Logger;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptors.CheckedForwardingClientCall;
+import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 
 /**
  * Manages a set of ClosableChannels and uses them in a round robin.
  */
-public class ChannelPool extends Channel {
+public class ChannelPool extends ManagedChannel {
 
-  protected static final Logger log = Logger.getLogger(ChannelPool.class.getName());
+  protected static final Logger LOG = new Logger(ChannelPool.class);
+
+  public interface ChannelFactory {
+    ManagedChannel create() throws IOException;
+  }
+
+  private final AtomicReference<ImmutableList<ManagedChannel>> channels = new AtomicReference<>();
+  private final AtomicInteger requestCount = new AtomicInteger();
+  private final ImmutableList<HeaderInterceptor> headerInterceptors;
+  private final ChannelFactory factory;
+  private final String authority;
+
+  private boolean shutdown = false;
+
+  public ChannelPool(List<HeaderInterceptor> headerInterceptors, ChannelFactory factory)
+      throws IOException {
+    ManagedChannel channel = factory.create();
+    this.channels.set(ImmutableList.of(channel));
+    authority = channel.authority();
+    this.factory = factory;
+    if (headerInterceptors == null) {
+      this.headerInterceptors = ImmutableList.of();
+    } else {
+      this.headerInterceptors = ImmutableList.copyOf(headerInterceptors);
+    }
+  }
 
   /**
-   * An implementation of {@link Channel} that knows how to return itself to the {@link ChannelPool}
+   * Makes sure that the number of channels is at least as big as the specified capacity.  This
+   * method is only synchornized when the pool has to be expanded.
+   *
+   * @param capacity The minimum number of channels required for the RPCs of the ChannelPool's
+   * clients.
    */
-  public class PooledChannel extends Channel {
-    private final Channel delegate;
-    private boolean returned = false;
-
-    private PooledChannel(Channel delegate, boolean returned) {
-      this.delegate = delegate;
-      this.returned = returned;
+  public void ensureChannelCount(int capacity) throws IOException {
+    if (this.shutdown) {
+      throw new IOException("The channel is closed.");
     }
-
-    @Override
-    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
-        MethodDescriptor<RequestT, ResponseT> methodDescriptor, CallOptions callOptions) {
-      return createWrappedCall(methodDescriptor, callOptions, delegate);
-    }
-
-    @Override
-    public String authority() {
-      return delegate.authority();
-    }
-
-    public synchronized void returnToPool() {
-      if (!returned) {
-        ChannelPool.this.returnChannel(this);
-        returned = true;
+    if (channels.get().size() < capacity) {
+      synchronized (this) {
+        if (channels.get().size() < capacity) {
+          List<ManagedChannel> newChannelList = new ArrayList<>(channels.get());
+          while(newChannelList.size() < capacity) {
+            newChannelList.add(factory.create());
+          }
+          setChannels(newChannelList);
+        }
       }
     }
   }
 
-  private List<Channel> channels;
-  private final AtomicInteger requestCount = new AtomicInteger();
-  private final List<HeaderInterceptor> headerInterceptors;
-
-  public ChannelPool(List<Channel> channels, List<HeaderInterceptor> headerInterceptors) {
-    this.channels = new ArrayList<>(channels);
-    this.headerInterceptors = headerInterceptors;
+  /**
+   * Performs a simple round robin on the list of {@link Channel}s in the {@code channels} list.
+   * This method should not be synchronized, if possible, to reduce bottlenecks.
+   * 
+   * @return A channel that can be used for a safe 
+   */
+  private ManagedChannel getNextChannel() {
+    int currentRequestNum = requestCount.getAndIncrement();
+    ImmutableList<ManagedChannel> channelsList = channels.get();
+    int index = Math.abs(currentRequestNum % channelsList.size());
+    return channelsList.get(index);
   }
 
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public String authority() {
+    return authority;
+  }
+
+  /**
+   * Create a {@link ClientCall} on a Channel from the pool chosen in a round-robin fashion to the
+   * remote operation specified by the given {@link MethodDescriptor}. The returned {@link
+   * ClientCall} does not trigger any remote behavior until {@link
+   * ClientCall#start(ClientCall.Listener, Metadata)} is
+   * invoked.
+   *
+   * @param methodDescriptor describes the name and parameter types of the operation to call.
+   * @param callOptions runtime options to be applied to this call.
+   * @return a {@link ClientCall} bound to the specified method.
+   */
   @Override
   public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
       MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions) {
+    Preconditions.checkState(!shutdown, "Cannot perform operations on a closed connection");
     return createWrappedCall(methodDescriptor, callOptions, getNextChannel());
   }
 
   private <ReqT, RespT> ClientCall<ReqT, RespT> createWrappedCall(
-      MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions, Channel channel) {
-    return wrap(channel.newCall(methodDescriptor, callOptions));
-  }
-
-  private <ReqT, RespT> ClientCall<ReqT, RespT> wrap(ClientCall<ReqT, RespT> delegate) {
+      MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions, ManagedChannel channel) {
+    ClientCall<ReqT, RespT> delegate = channel.newCall(methodDescriptor, callOptions);
     return new CheckedForwardingClientCall<ReqT, RespT>(delegate) {
       @Override
       protected void checkedStart(ClientCall.Listener<RespT> responseListener, Metadata headers)
@@ -100,42 +144,63 @@ public class ChannelPool extends Channel {
     };
   }
 
-  private synchronized Channel getNextChannel() {
-    int currentRequestNum = requestCount.getAndIncrement();
-    int index = Math.abs(currentRequestNum % channels.size());
-    return channels.get(index);
+  /**
+   * Sets the values in newChannelList to the {@code channels} AtomicReference.  The values are
+   * copied into an {@link ImmutableList}.
+   *
+   * @param newChannelList A {@link List} of {@link ManagedChannel}s to set to the {@code channels}
+   */
+  private void setChannels(List<ManagedChannel> newChannelList) {
+    channels.set(ImmutableList.copyOf(newChannelList));
+  }
+
+  public int size() {
+    return channels.get().size();
   }
 
   @Override
-  public String authority() {
-    return channels.get(0).authority();
-  }
-
-  /**
-   * Gets a channel from the pool. Long running streaming RPCs can cause a contention issue if there
-   * is another RPC started on the same channel. If the pool only has a single channel, keep the
-   * channel in the pool so that other RPCs can at least attempt to use it.
-   */
-  public synchronized PooledChannel reserveChannel() {
-    Channel reserved;
-    boolean returned = false;
-    if (channels.size() == 1) {
-      reserved = channels.get(0);
-      returned = true;
-    } else {
-      reserved = channels.remove(0);
+  public synchronized ManagedChannel shutdown() {
+    for (ManagedChannel channel : channels.get()) {
+      channel.shutdown();
     }
-    return new PooledChannel(reserved, returned);
+    this.shutdown = true;
+    return this;
   }
 
-  private synchronized void returnChannel(PooledChannel channel){
-    if (!channel.returned) {
-      channels.add(channel.delegate);
+  @Override
+  public boolean isShutdown() {
+    return shutdown;
+  }
+
+  @Override
+  public boolean isTerminated() {
+    for (ManagedChannel managedChannel: channels.get()) {
+      if (!managedChannel.isTerminated()) {
+        return false;
+      }
     }
+    return true;
   }
 
-  @VisibleForTesting
-  public synchronized int size() {
-    return channels.size();
+  @Override
+  public ManagedChannel shutdownNow() {
+    for (ManagedChannel channel : channels.get()) {
+      channel.shutdownNow();
+    }
+    return this;
+  }
+
+  @Override
+  public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+    long endTimeNanos = System.nanoTime() + unit.toNanos(timeout);
+    for (ManagedChannel channel : channels.get()) {
+      long awaitTimeNanos = endTimeNanos - System.nanoTime();
+      if (awaitTimeNanos <= 0) {
+        break;
+      }
+      channel.awaitTermination(awaitTimeNanos, TimeUnit.NANOSECONDS);
+    }
+
+    return isTerminated();
   }
 }

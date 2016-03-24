@@ -16,11 +16,8 @@
 package com.google.cloud.bigtable.dataflow;
 
 import java.io.IOException;
-import java.util.Iterator;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.client.Connection;
@@ -30,129 +27,57 @@ import org.slf4j.LoggerFactory;
 import com.google.cloud.bigtable.hbase.BigtableOptionsFactory;
 import com.google.cloud.bigtable.hbase1_0.BigtableConnection;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.LinkedHashMultimap;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * Pubsub and other windowed sources can have a large quantity of bundles in short amounts of time.
- * {@link CloudBigtableIO.AbstractCloudBigtableTableWriteFn} should not create a connection per
+ * {@link AbstractCloudBigtableTableDoFn} should not create a connection per
  * bundle, since that could happen ever few milliseconds. Rather, it should rely on a connection
  * pool to better manage connection life-cycles.
  */
 public class CloudBigtableConnectionPool {
 
-  private static final int MAX_TTL_MILLISECONDS = 30 * 60 * 1000;
   protected static final Logger LOG = LoggerFactory.getLogger(CloudBigtableConnectionPool.class);
 
-  /**
-   * This class abstracts a connection that could be returned to a
-   * {@link CloudBigtableConnectionPool}.
-   */
-  public static class PoolEntry {
-    private final String key;
-    private final Connection connection;
-    private final long expiresTimeMs;
-
-    private static long getExpiration() {
-      return System.currentTimeMillis() + MAX_TTL_MILLISECONDS;
-    }
-
-    public PoolEntry(String key, Connection connection) {
-      this(key, connection, getExpiration());
-    }
-
-    @VisibleForTesting
-    PoolEntry(String key, Connection connection, long expiresTimeMs) {
-      this.key = key;
-      this.connection = connection;
-      this.expiresTimeMs = expiresTimeMs;
-    }
-
-    public Connection getConnection() {
-      return connection;
-    }
-
-    public String getKey() {
-      return key;
-    }
-
-    public boolean isExpired() {
-      return System.currentTimeMillis() > expiresTimeMs;
-    }
-
-    @Override
-    public String toString() {
-      return String.format("%s key=%s, hash=%s", getClass().getName(), key, super.toString());
-    }
-  }
-
-  private static ExecutorService createDefaultCloseExecutorService() {
-    return Executors.newCachedThreadPool(
-      new ThreadFactoryBuilder()
-          .setNameFormat("CloudBigtableConnectionPool-cleanup-%s")
-          .setDaemon(true)
-          .build());
-  }
-
-  private final LinkedHashMultimap<String, PoolEntry> connections = LinkedHashMultimap.create();
-  private final ExecutorService connectionCloseExecutor;
+  private final Map<String, Connection> connections = new HashMap<>();
 
   public CloudBigtableConnectionPool() {
-    this(createDefaultCloseExecutorService());
   }
 
-  @VisibleForTesting
-  CloudBigtableConnectionPool(ExecutorService executorService) {
-    this.connectionCloseExecutor = executorService;
-  }
-
-  public PoolEntry getConnection(Configuration config) throws IOException {
+  /**
+   * Gets a shared connection where the cluster name from the config is the key.
+   *
+   * <p>NOTE: Do not call close() on the connection, since it's shared.
+   *
+   * @param config
+   * @return
+   * @throws IOException
+   */
+  public Connection getConnection(Configuration config) throws IOException {
     String key = BigtableOptionsFactory.fromConfiguration(config).getClusterName().toString();
     return getConnection(config, key);
   }
 
-  protected synchronized PoolEntry getConnection(Configuration config, String key)
+  protected synchronized Connection getConnection(Configuration config, String key)
       throws IOException {
-    Set<PoolEntry> entries = connections.get(key);
-    if (entries.isEmpty()) {
-      return createConnection(config, key);
+    Connection connection = connections.get(key);
+    if (connection == null) {
+      connection = createConnection(config);
+      connections.put(key, connection);
     }
-    for (Iterator<PoolEntry> iterator = entries.iterator(); iterator.hasNext();) {
-      PoolEntry entry = iterator.next();
-      iterator.remove();
-      if (entry.isExpired()) {
-        closeAsynchronously(entry);
-      } else {
-        return entry;
-      }
-    }
-    return createConnection(config, key);
+    return connection;
   }
 
   @VisibleForTesting
-  protected PoolEntry createConnection(Configuration config, String key) throws IOException {
-    return new PoolEntry(key, new BigtableConnection(config));
-  }
-
-  public synchronized void returnConnection(PoolEntry entry) throws IOException {
-    if (entry.isExpired()) {
-      closeAsynchronously(entry);
-    } else {
-      connections.put(entry.getKey(), entry);
-    }
-  }
-
-  private void closeAsynchronously(final PoolEntry entry) throws IOException {
-    connectionCloseExecutor.submit(new Callable<Void>() {
+  protected Connection createConnection(Configuration config) throws IOException {
+    return new BigtableConnection(config) {
       @Override
-      public Void call() throws Exception {
-        try {
-          entry.connection.close();
-        } catch (Exception e) {
-          LOG.warn("Could not close a connection asynchronously.", e);
-        }
-        return null;
+      public void close() throws IOException {
+        // Users should not actually close the shared connection. Make sure that if a user does call
+        // close, that nothing bad happens to other potential users.
+        // All of the resources will be cleaned up when the JVM closes.
+        LOG.info("Calling close() on the connection from dataflow is a noop. "
+            + "Please don't close() the connection yourself.");
       }
-    });
+    };
   }
 }

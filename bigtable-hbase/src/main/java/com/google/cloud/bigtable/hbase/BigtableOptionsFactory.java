@@ -19,13 +19,16 @@ import static com.google.api.client.util.Strings.isNullOrEmpty;
 import static com.google.cloud.bigtable.config.BigtableOptions.BIGTABLE_CLUSTER_ADMIN_HOST_DEFAULT;
 import static com.google.cloud.bigtable.config.BigtableOptions.BIGTABLE_DATA_HOST_DEFAULT;
 import static com.google.cloud.bigtable.config.BigtableOptions.BIGTABLE_TABLE_ADMIN_HOST_DEFAULT;
-import static com.google.cloud.bigtable.config.BigtableOptions.DEFAULT_BIGTABLE_PORT;
+import static com.google.cloud.bigtable.config.BigtableOptions.BIGTABLE_PORT_DEFAULT;
+import static com.google.cloud.bigtable.config.BigtableOptions.BIGTABLE_ASYNC_MUTATOR_COUNT_DEFAULT;
 
 import com.google.cloud.bigtable.config.BigtableOptions;
 import com.google.cloud.bigtable.config.CredentialOptions;
 import com.google.cloud.bigtable.config.Logger;
 import com.google.cloud.bigtable.config.RetryOptions;
 import com.google.common.base.Preconditions;
+
+import io.grpc.Status;
 
 import org.apache.hadoop.conf.Configuration;
 
@@ -50,11 +53,6 @@ public class BigtableOptionsFactory {
   public static final String PROJECT_ID_KEY = "google.bigtable.project.id";
   public static final String CLUSTER_KEY = "google.bigtable.cluster.name";
   public static final String ZONE_KEY = "google.bigtable.zone.name";
-
-  /**
-   * If set, bypass DNS host lookup and use the given IP address.
-   */
-  public static final String IP_OVERRIDE_KEY = "google.bigtable.endpoint.ip.address.override";
 
   /**
    * Key to set to enable service accounts to be used, either metadata server-based or P12-based.
@@ -97,6 +95,13 @@ public class BigtableOptionsFactory {
    * The default is to enable retries on failed idempotent operations.
    */
   public static final String ENABLE_GRPC_RETRIES_KEY = "google.bigtable.grpc.retry.enable";
+
+  /**
+   * Key to set to a comma separated list of grpc codes to retry. See {@link Status.Code} for more
+   * information.
+   */
+  public static final String ADDITIONAL_RETRY_CODES = "google.bigtable.grpc.retry.codes";
+
   /**
    * Key to set to a boolean flag indicating whether or not to retry grpc call on deadline exceeded.
    * This flag is used only when grpc retries is enabled.
@@ -117,6 +122,12 @@ public class BigtableOptionsFactory {
       "google.bigtable.grpc.read.partial.row.timeout.ms";
 
   /**
+   * Key to set the number of time to retry after a scan timeout
+   */
+  public static final String MAX_SCAN_TIMEOUT_RETRIES =
+      "google.bigtable.grpc.retry.max.scan.timeout.retries";
+
+  /**
    * Key to set the maximum number of messages to buffer when scanning.
    */
   public static final String READ_BUFFER_SIZE = "google.bigtable.grpc.read.streaming.buffer.size";
@@ -130,11 +141,27 @@ public class BigtableOptionsFactory {
    * The number of grpc channels to open for asynchronous processing such as puts.
    */
   public static final String BIGTABLE_DATA_CHANNEL_COUNT_KEY = "google.bigtable.grpc.channel.count";
+
   /**
    * The maximum length of time to keep a Bigtable grpc channel open.
    */
   public static final String BIGTABLE_CHANNEL_TIMEOUT_MS_KEY =
       "google.bigtable.grpc.channel.timeout.ms";
+
+  public static final String BIGTABLE_USE_BULK_API =
+      "google.bigtable.use.bulk.api";
+
+  public static final String BIGTABLE_BULK_MAX_REQUEST_SIZE_BYTES =
+      "google.bigtable.bulk.max.request.size.bytes";
+
+  public static final String BIGTABLE_BULK_MAX_ROW_KEY_COUNT =
+      "google.bigtable.bulk.max.row.key.count";
+
+  /**
+   * The number of asynchronous workers to use for buffered mutator operations.
+   */
+  public static final String BIGTABLE_ASYNC_MUTATOR_COUNT_KEY =
+      "google.bigtable.buffered.mutator.async.worker.count";
 
   public static BigtableOptions fromConfiguration(final Configuration configuration)
       throws IOException {
@@ -144,12 +171,6 @@ public class BigtableOptionsFactory {
     bigtableOptionsBuilder.setProjectId(getValue(configuration, PROJECT_ID_KEY, "Project ID"));
     bigtableOptionsBuilder.setZoneId(getValue(configuration, ZONE_KEY, "Zone"));
     bigtableOptionsBuilder.setClusterId(getValue(configuration, CLUSTER_KEY, "Cluster"));
-
-    String overrideIp = configuration.get(IP_OVERRIDE_KEY);
-    if (!isNullOrEmpty(overrideIp)) {
-      LOG.debug("Using override IP address %s", overrideIp);
-      bigtableOptionsBuilder.setOverrideIp(overrideIp);
-    }
 
     bigtableOptionsBuilder.setDataHost(
         getHost(configuration, BIGTABLE_HOST_KEY, BIGTABLE_DATA_HOST_DEFAULT, "API Data"));
@@ -161,9 +182,23 @@ public class BigtableOptionsFactory {
     bigtableOptionsBuilder.setClusterAdminHost(getHost(configuration,
         BIGTABLE_CLUSTER_ADMIN_HOST_KEY, BIGTABLE_CLUSTER_ADMIN_HOST_DEFAULT, "Cluster Admin"));
 
-    int port = configuration.getInt(BIGTABLE_PORT_KEY, DEFAULT_BIGTABLE_PORT);
+    int port = configuration.getInt(BIGTABLE_PORT_KEY, BIGTABLE_PORT_DEFAULT);
     bigtableOptionsBuilder.setPort(port);
     setChannelOptions(bigtableOptionsBuilder, configuration);
+    
+    int asyncMutatorCount = configuration.getInt(
+        BIGTABLE_ASYNC_MUTATOR_COUNT_KEY, BIGTABLE_ASYNC_MUTATOR_COUNT_DEFAULT);
+    bigtableOptionsBuilder.setAsyncMutatorWorkerCount(asyncMutatorCount);
+
+    bigtableOptionsBuilder.setUseBulkApi(configuration.getBoolean(BIGTABLE_USE_BULK_API, false));
+    bigtableOptionsBuilder.setBulkMaxRowKeyCount(
+        configuration.getInt(
+            BIGTABLE_BULK_MAX_ROW_KEY_COUNT,
+            BigtableOptions.BIGTABLE_BULK_MAX_ROW_KEY_COUNT_DEFAULT));
+    bigtableOptionsBuilder.setBulkMaxRequestSize(
+        configuration.getLong(
+            BIGTABLE_BULK_MAX_REQUEST_SIZE_BYTES,
+            BigtableOptions.BIGTABLE_BULK_MAX_REQUEST_SIZE_BYTES_DEFAULT));
 
     return bigtableOptionsBuilder.build();
   }
@@ -246,13 +281,25 @@ public class BigtableOptionsFactory {
   private static RetryOptions createRetryOptions(Configuration configuration) {
     RetryOptions.Builder retryOptionsBuilder = new RetryOptions.Builder();
     boolean enableRetries = configuration.getBoolean(
-        ENABLE_GRPC_RETRIES_KEY, RetryOptions.ENABLE_GRPC_RETRIES_DEFAULT);
+        ENABLE_GRPC_RETRIES_KEY, RetryOptions.DEFAULT_ENABLE_GRPC_RETRIES);
     LOG.debug("gRPC retries enabled: %s", enableRetries);
     retryOptionsBuilder.setEnableRetries(enableRetries);
 
-    boolean retryOnDeadlineExceeded = configuration.getBoolean(
-        ENABLE_GRPC_RETRY_DEADLINEEXCEEDED_KEY,
-        RetryOptions.ENABLE_GRPC_RETRY_DEADLINE_EXCEEDED_DEFAULT);
+    String retryCodes = configuration.get(ADDITIONAL_RETRY_CODES, "");
+    String codes[] = retryCodes.split(",");
+    for (String stringCode : codes) {
+      String trimmed = stringCode.trim();
+      if (trimmed.isEmpty()) {
+        continue;
+      }
+      Status.Code code = Status.Code.valueOf(trimmed);
+      Preconditions.checkArgument(code != null, "Code " + stringCode + " not found.");
+      LOG.debug("gRPC retry on: %s", stringCode);
+      retryOptionsBuilder.addStatusToRetryOn(code);
+    }
+
+    boolean retryOnDeadlineExceeded =
+        configuration.getBoolean(ENABLE_GRPC_RETRY_DEADLINEEXCEEDED_KEY, true);
     LOG.debug("gRPC retry on deadline exceeded enabled: %s", retryOnDeadlineExceeded);
     retryOptionsBuilder.setRetryOnDeadlineExceeded(retryOnDeadlineExceeded);
 
@@ -276,6 +323,11 @@ public class BigtableOptionsFactory {
       READ_BATCH_SIZE, RetryOptions.DEFAULT_STREAMING_BATCH_SIZE);
     LOG.debug("gRPC read batch size (count): %d", streamingBatchSize);
     retryOptionsBuilder.setStreamingBatchSize(streamingBatchSize);
+
+    int maxScanTimeoutRetries = configuration.getInt(
+        MAX_SCAN_TIMEOUT_RETRIES, RetryOptions.DEFAULT_MAX_SCAN_TIMEOUT_RETRIES);
+    LOG.debug("gRPC max scan timeout retries (count): %d", maxScanTimeoutRetries);
+    retryOptionsBuilder.setMaxScanTimeoutRetries(maxScanTimeoutRetries);
 
     return retryOptionsBuilder.build();
   }

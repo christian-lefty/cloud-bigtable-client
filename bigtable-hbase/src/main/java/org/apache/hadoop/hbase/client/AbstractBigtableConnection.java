@@ -20,9 +20,11 @@ import com.google.cloud.bigtable.config.BigtableOptions;
 import com.google.cloud.bigtable.config.Logger;
 import com.google.cloud.bigtable.grpc.BigtableDataClient;
 import com.google.cloud.bigtable.grpc.BigtableSession;
+import com.google.cloud.bigtable.grpc.BigtableSessionSharedThreadPools;
 import com.google.cloud.bigtable.grpc.BigtableTableAdminClient;
 import com.google.cloud.bigtable.grpc.async.AsyncExecutor;
-import com.google.cloud.bigtable.grpc.async.HeapSizeManager;
+import com.google.cloud.bigtable.grpc.async.RpcThrottler;
+import com.google.cloud.bigtable.grpc.async.ResourceLimiter;
 import com.google.cloud.bigtable.hbase.BatchExecutor;
 import com.google.cloud.bigtable.hbase.BigtableBufferedMutator;
 import com.google.cloud.bigtable.hbase.BigtableOptionsFactory;
@@ -35,7 +37,6 @@ import com.google.common.util.concurrent.MoreExecutors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.security.User;
-import org.apache.hadoop.hbase.util.Threads;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -46,8 +47,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -91,20 +90,35 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
   private volatile boolean closed = false;
   private volatile boolean aborted;
   private volatile ExecutorService batchPool = null;
+  private ExecutorService bufferedMutatorExecutorService;
 
   private BigtableSession session;
 
   private volatile boolean cleanupPool = false;
   private final BigtableOptions options;
-  private final TableConfiguration tableConfig;
 
   // A set of tables that have been disabled via BigtableAdmin.
   private Set<TableName> disabledTables = new HashSet<>();
+  private static ResourceLimiter resourceLimiter;
 
   public AbstractBigtableConnection(Configuration conf) throws IOException {
     this(conf, false, null, null);
   }
 
+  /**
+   * The constructor called from {@link ConnectionFactory#createConnection(Configuration)} and
+   * in its many forms via reflection with this specific signature.
+   *
+   * @param conf The configuration for this channel. See {@link BigtableOptionsFactory} for more details.
+   * @param managed This should always be false. It's an artifact of old HBase behavior.
+   * @param pool An {@link ExecutorService} to run HBase/Bigtable object conversions on. The RPCs
+   *             themselves run via NIO, and not on a waiting thread
+   * @param user This is an artifact of HBase which Cloud Bigtable ignores. User information is
+   * captured in the Credentials configuration in conf.
+   *
+   * @throws IOException if the setup is not correct. The most likely issue is ALPN or OpenSSL 
+   * misconfiguration.
+   */
   protected AbstractBigtableConnection(Configuration conf, boolean managed, ExecutorService pool,
       User user) throws IOException {
     if (managed) {
@@ -120,13 +134,21 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
 
     this.batchPool = pool;
     this.closed = false;
+    this.session = new BigtableSession(options);
 
-    if (batchPool == null) {
-      batchPool = getBatchPool();
+    initializeResourceLimiter(conf, options);
+  }
+
+  private synchronized static void initializeResourceLimiter(
+      Configuration conf, BigtableOptions options) {
+    if (resourceLimiter == null) {
+      int defaultRpcCount = AsyncExecutor.MAX_INFLIGHT_RPCS_DEFAULT * options.getChannelCount();
+      int maxInflightRpcs = conf.getInt(MAX_INFLIGHT_RPCS_KEY, defaultRpcCount);
+      long maxMemory = conf.getLong(
+          BIGTABLE_BUFFERED_MUTATOR_MAX_MEMORY_KEY,
+          AsyncExecutor.ASYNC_MUTATOR_MAX_MEMORY_DEFAULT);
+      AbstractBigtableConnection.resourceLimiter = new ResourceLimiter(maxMemory, maxInflightRpcs);
     }
-
-    this.session = new BigtableSession(options, batchPool);
-    this.tableConfig = new TableConfiguration(conf);
   }
 
   @Override
@@ -136,17 +158,17 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
 
   @Override
   public Table getTable(TableName tableName) throws IOException {
-    return getTable(tableName, getBatchPool());
+    return getTable(tableName, batchPool);
   }
 
   @Override
   public Table getTable(TableName tableName, ExecutorService pool) throws IOException {
     BigtableDataClient client = session.getDataClient();
-    HeapSizeManager heapSizeManager =
-        new HeapSizeManager(AsyncExecutor.ASYNC_MUTATOR_MAX_MEMORY_DEFAULT,
-            AsyncExecutor.MAX_INFLIGHT_RPCS_DEFAULT);
+    if (pool == null) {
+      pool = BigtableSessionSharedThreadPools.getInstance().getBatchThreadPool();
+    }
     BatchExecutor batchExecutor = new BatchExecutor(
-         new AsyncExecutor(client, heapSizeManager),
+         new AsyncExecutor(client, new RpcThrottler(resourceLimiter)),
          options,
          MoreExecutors.listeningDecorator(pool),
          createAdapter(tableName));
@@ -159,23 +181,19 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
     if (tableName == null) {
       throw new IllegalArgumentException("TableName cannot be null.");
     }
-    long maxHeapSize = params.getWriteBufferSize();
-    if (maxHeapSize == BufferedMutatorParams.UNSET) {
-      params.writeBufferSize(tableConfig.getWriteBufferSize());
-    }
-
-    int defaultRpcCount = AsyncExecutor.MAX_INFLIGHT_RPCS_DEFAULT * options.getChannelCount();
-    int maxInflightRpcs = conf.getInt(MAX_INFLIGHT_RPCS_KEY, defaultRpcCount);
 
     final long id = SEQUENCE_GENERATOR.incrementAndGet();
 
+    ExecutorService pool = batchPool != null ? batchPool
+        : BigtableSessionSharedThreadPools.getInstance().getBatchThreadPool();
     BigtableBufferedMutator bigtableBufferedMutator = new BigtableBufferedMutator(
         session.getDataClient(),
         createAdapter(tableName),
         conf,
-        options.getDataHost().toString(),
+        options,
         params.getListener(),
-        new HeapSizeManager(maxHeapSize, maxInflightRpcs)) {
+        new RpcThrottler(resourceLimiter),
+        pool) {
       @Override
       public void close() throws IOException {
         try {
@@ -198,10 +216,7 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
     // HBase uses 2MB as the write buffer size.  Their limit is the size to reach before performing
     // a batch async write RPC.  Our limit is a memory cap for async RPC after which we throttle.
     // HBase does not throttle like we do.
-    long maxMemory = conf.getLong(
-        BIGTABLE_BUFFERED_MUTATOR_MAX_MEMORY_KEY,
-        AsyncExecutor.ASYNC_MUTATOR_MAX_MEMORY_DEFAULT);
-    return getBufferedMutator(new BufferedMutatorParams(tableName).writeBufferSize(maxMemory));
+    return getBufferedMutator(new BufferedMutatorParams(tableName));
   }
 
   /** This should not be used.  The hbase shell needs this in hbsae 0.99.2.  Remove this once
@@ -270,6 +285,10 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
       // shutting down the clients, it's not entirely safe to shutdown the pool
       // (via a finally block).
       shutdownBatchPool();
+      if (this.bufferedMutatorExecutorService != null) {
+        this.bufferedMutatorExecutorService.shutdown();
+        this.bufferedMutatorExecutorService = null;
+      }
       this.closed = true;
     }
   }
@@ -283,48 +302,6 @@ public abstract class AbstractBigtableConnection implements Connection, Closeabl
       .add("dataHost", options.getDataHost())
       .add("tableAdminHost", options.getTableAdminHost())
       .toString();
-  }
-
-  // Copied from org.apache.hadoop.hbase.client.HConnectionManager#getBatchPool()
-  private ExecutorService getBatchPool() {
-    if (batchPool == null) {
-      // shared HTable thread executor not yet initialized
-      synchronized (this) {
-        if (batchPool == null) {
-          int maxThreads = getMaxThreads();
-          int minThreads = Math.min(getCoreThreads(), maxThreads);
-          long keepAliveTime = conf.getLong("hbase.hconnection.threads.keepalivetime", 60);
-          LinkedBlockingQueue<Runnable> workQueue =
-              new LinkedBlockingQueue<Runnable>(128 * conf.getInt("hbase.client.max.total.tasks",
-                200));
-          this.batchPool = new ThreadPoolExecutor(
-              minThreads,
-              maxThreads,
-              keepAliveTime,
-              TimeUnit.SECONDS,
-              workQueue,
-              Threads.newDaemonThreadFactory("bigtable-connection-shared-executor"));
-        }
-        this.cleanupPool = true;
-      }
-    }
-    return this.batchPool;
-  }
-
-  private int getCoreThreads() {
-    int coreThreads = conf.getInt("hbase.hconnection.threads.core", options.getChannelCount() * 2);
-    if (coreThreads == 0) {
-      coreThreads = Runtime.getRuntime().availableProcessors() * 8;
-    }
-    return coreThreads;
-  }
-
-  private int getMaxThreads() {
-    int maxThreads = conf.getInt("hbase.hconnection.threads.max", 256);
-    if (maxThreads == 0) {
-      maxThreads = Runtime.getRuntime().availableProcessors() * 8;
-    }
-    return maxThreads;
   }
 
   // Copied from org.apache.hadoop.hbase.client.HConnectionManager#shutdownBatchPool()

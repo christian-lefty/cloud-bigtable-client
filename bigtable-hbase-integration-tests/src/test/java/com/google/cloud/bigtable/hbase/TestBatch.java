@@ -15,11 +15,20 @@
  */
 package com.google.cloud.bigtable.hbase;
 
-import static com.google.cloud.bigtable.hbase.IntegrationTests.*;
+import static com.google.cloud.bigtable.hbase.IntegrationTests.COLUMN_FAMILY;
+import static com.google.cloud.bigtable.hbase.IntegrationTests.TABLE_NAME;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
 
 import org.apache.commons.lang.ArrayUtils;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.client.Append;
+import org.apache.hadoop.hbase.client.Connection;
+import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Increment;
@@ -35,11 +44,6 @@ import org.junit.Assert;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
-
 public class TestBatch extends AbstractTest {
   /**
    * Requirement 8.1 - Batch performs a collection of Deletes, Gets, Puts, Increments, and Appends
@@ -52,7 +56,6 @@ public class TestBatch extends AbstractTest {
    * a batch() operation.
    */
   @Test
-  @Category(KnownGap.class)
   public void testBatchPutGetAndDelete() throws IOException, InterruptedException {
     // Initialize data
     Table table = getConnection().getTable(TABLE_NAME);
@@ -276,7 +279,7 @@ public class TestBatch extends AbstractTest {
    */
   @Test
   @Category(KnownGap.class)
-  public void testRowMutations() throws IOException, InterruptedException {
+  public void testRowMutations() throws IOException {
     // Initialize data
     Table table = getConnection().getTable(TABLE_NAME);
     byte[] rowKey = dataHelper.randomData("testrow-");
@@ -365,5 +368,17 @@ public class TestBatch extends AbstractTest {
       CellUtil.cloneValue(((Result) results[1]).getColumnLatestCell(COLUMN_FAMILY, qual2)));
 
     table.close();
+  }
+
+  @Test
+  public void testBatchDoesntHang() throws Exception {
+    Connection closedConnection = ConnectionFactory.createConnection(IntegrationTests.getConfiguration());
+    Table table = closedConnection.getTable(TABLE_NAME);
+    closedConnection.close();
+    try {
+      table.batch(Arrays.asList(new Get(Bytes.toBytes("key"))), new Object[1]);
+      Assert.fail("Expected an exception");
+    } catch(Exception e) {
+    }
   }
 }

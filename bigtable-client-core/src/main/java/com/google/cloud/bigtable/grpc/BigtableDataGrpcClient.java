@@ -16,22 +16,25 @@
 package com.google.cloud.bigtable.grpc;
 
 import io.grpc.CallOptions;
-import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.Metadata;
-import io.grpc.MethodDescriptor;
 import io.grpc.Status;
+import io.grpc.stub.ClientCalls;
 
+import java.io.IOException;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
-
-import javax.annotation.Nullable;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.bigtable.v1.BigtableServiceGrpc;
 import com.google.bigtable.v1.CheckAndMutateRowRequest;
 import com.google.bigtable.v1.CheckAndMutateRowResponse;
 import com.google.bigtable.v1.MutateRowRequest;
+import com.google.bigtable.v1.MutateRowsRequest;
+import com.google.bigtable.v1.MutateRowsRequest.Entry;
+import com.google.bigtable.v1.MutateRowsResponse;
 import com.google.bigtable.v1.Mutation;
 import com.google.bigtable.v1.ReadModifyWriteRowRequest;
 import com.google.bigtable.v1.ReadRowsRequest;
@@ -39,14 +42,14 @@ import com.google.bigtable.v1.ReadRowsResponse;
 import com.google.bigtable.v1.Row;
 import com.google.bigtable.v1.SampleRowKeysRequest;
 import com.google.bigtable.v1.SampleRowKeysResponse;
+import com.google.cloud.bigtable.config.BigtableOptions;
+import com.google.cloud.bigtable.config.Logger;
 import com.google.cloud.bigtable.config.RetryOptions;
 import com.google.cloud.bigtable.grpc.async.BigtableAsyncUtilities;
-import com.google.cloud.bigtable.grpc.async.RetryableRpc;
+import com.google.cloud.bigtable.grpc.async.RetryingRpcFunction;
+import com.google.cloud.bigtable.grpc.async.BigtableAsyncRpc;
 import com.google.cloud.bigtable.grpc.io.CancellationToken;
 import com.google.cloud.bigtable.grpc.io.ChannelPool;
-import com.google.cloud.bigtable.grpc.io.ChannelPool.PooledChannel;
-import com.google.cloud.bigtable.grpc.io.ClientCallService;
-import com.google.cloud.bigtable.grpc.io.RetryingCall;
 import com.google.cloud.bigtable.grpc.scanner.BigtableResultScannerFactory;
 import com.google.cloud.bigtable.grpc.scanner.ResponseQueueReader;
 import com.google.cloud.bigtable.grpc.scanner.ResultScanner;
@@ -54,8 +57,11 @@ import com.google.cloud.bigtable.grpc.scanner.ResumingStreamingResultScanner;
 import com.google.cloud.bigtable.grpc.scanner.StreamingBigtableResultScanner;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.Empty;
 import com.google.protobuf.ServiceException;
 
@@ -64,13 +70,33 @@ import com.google.protobuf.ServiceException;
  */
 public class BigtableDataGrpcClient implements BigtableDataClient {
 
+  private static final Logger LOG = new Logger(BigtableDataGrpcClient.class);
+  private static AtomicInteger LOG_COUNT = new AtomicInteger();
+
   @VisibleForTesting
   public static final Predicate<MutateRowRequest> IS_RETRYABLE_MUTATION =
       new Predicate<MutateRowRequest>() {
         @Override
-        public boolean apply(@Nullable MutateRowRequest mutateRowRequest) {
+        public boolean apply(MutateRowRequest mutateRowRequest) {
           return mutateRowRequest != null
               && allCellsHaveTimestamps(mutateRowRequest.getMutationsList());
+        }
+      };
+
+  @VisibleForTesting
+  public static final Predicate<MutateRowsRequest> ARE_RETRYABLE_MUTATIONS =
+      new Predicate<MutateRowsRequest>() {
+        @Override
+        public boolean apply(MutateRowsRequest mutateRowsRequest) {
+          if (mutateRowsRequest == null) {
+            return false;
+          }
+          for (Entry entry : mutateRowsRequest.getEntriesList()) {
+            if (!allCellsHaveTimestamps(entry.getMutationsList())) {
+              return false;
+            }
+          }
+          return true;
         }
       };
 
@@ -78,12 +104,18 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
   public static final Predicate<CheckAndMutateRowRequest> IS_RETRYABLE_CHECK_AND_MUTATE =
       new Predicate<CheckAndMutateRowRequest>() {
         @Override
-        public boolean apply(@Nullable CheckAndMutateRowRequest checkAndMutateRowRequest) {
+        public boolean apply(CheckAndMutateRowRequest checkAndMutateRowRequest) {
           return checkAndMutateRowRequest != null
               && allCellsHaveTimestamps(checkAndMutateRowRequest.getTrueMutationsList())
               && allCellsHaveTimestamps(checkAndMutateRowRequest.getFalseMutationsList());
         }
       };
+
+  private static final Predicate<SampleRowKeysRequest> IS_RETRYABLE_SAMPLE_ROW_KEY =
+      Predicates.<SampleRowKeysRequest> alwaysTrue();
+
+  private static final Predicate<ReadRowsRequest> IS_RETRYABLE_READ_ROW =
+      Predicates.<ReadRowsRequest> alwaysTrue();
 
   private static final boolean allCellsHaveTimestamps(Iterable<Mutation> mutations) {
     for (Mutation mut : mutations) {
@@ -97,9 +129,8 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
   private final ChannelPool channelPool;
 
   private final ScheduledExecutorService retryExecutorService;
-  private final ExecutorService executorService;
   private final RetryOptions retryOptions;
-
+  private final BigtableOptions bigtableOptions;
   private final BigtableResultScannerFactory streamingScannerFactory =
       new BigtableResultScannerFactory() {
         @Override
@@ -107,115 +138,189 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
           return streamRows(request);
         }
       };
-  private RetryableRpc<SampleRowKeysRequest, List<SampleRowKeysResponse>> sampleRowKeysAsync;
-  private RetryableRpc<ReadRowsRequest, List<Row>> readRowsAsync;
 
-  private ClientCallService clientCallService;
+  private final BigtableAsyncUtilities asyncUtilities;
 
-  public BigtableDataGrpcClient(
-      ChannelPool channelPool,
-      ExecutorService executorService,
-      ScheduledExecutorService retryExecutorService,
-    RetryOptions retryOptions) {
-    this(channelPool, executorService, retryExecutorService, retryOptions,
-        ClientCallService.DEFAULT);
+  private final BigtableAsyncRpc<SampleRowKeysRequest, List<SampleRowKeysResponse>> sampleRowKeysAsync;
+  private final BigtableAsyncRpc<ReadRowsRequest, List<Row>> readRowsAsync;
+
+  private final BigtableAsyncRpc<MutateRowRequest, Empty> mutateRowRpc;
+  private final BigtableAsyncRpc<MutateRowsRequest, MutateRowsResponse> mutateRowsRpc;
+  private final BigtableAsyncRpc<CheckAndMutateRowRequest, CheckAndMutateRowResponse> checkAndMutateRpc;
+  private final BigtableAsyncRpc<ReadModifyWriteRowRequest, Row> readWriteModifyRpc;
+
+  public BigtableDataGrpcClient(ChannelPool channelPool,
+      ScheduledExecutorService retryExecutorService, BigtableOptions bigtableOptions) {
+    this(channelPool, retryExecutorService, bigtableOptions,
+        new BigtableAsyncUtilities.Default(channelPool));
   }
 
   @VisibleForTesting
   BigtableDataGrpcClient(
       ChannelPool channelPool,
-      ExecutorService executorService,
       ScheduledExecutorService retryExecutorService,
-      RetryOptions retryOptions,
-      ClientCallService clientCallService) {
+      BigtableOptions bigtableOptions,
+      BigtableAsyncUtilities asyncUtilities) {
     this.channelPool = channelPool;
-    this.executorService = executorService;
-    this.retryOptions = retryOptions;
-    this.clientCallService = clientCallService;
     this.retryExecutorService = retryExecutorService;
+    this.bigtableOptions = bigtableOptions;
+    this.retryOptions = bigtableOptions.getRetryOptions();
+    this.asyncUtilities = asyncUtilities;
 
-    this.sampleRowKeysAsync =
-        BigtableAsyncUtilities.createSampleRowKeyAsyncReader(this.channelPool, clientCallService);
-    this.readRowsAsync =
-        BigtableAsyncUtilities.createRowKeyAysncReader(this.channelPool, clientCallService);
+    this.sampleRowKeysAsync = asyncUtilities.createSampleRowKeyAsyncReader();
+    this.readRowsAsync = asyncUtilities.createRowKeyAysncReader();
+    this.mutateRowRpc = asyncUtilities.createAsyncUnaryRpc(BigtableServiceGrpc.METHOD_MUTATE_ROW);
+    this.mutateRowsRpc = asyncUtilities.createAsyncUnaryRpc(BigtableServiceGrpc.METHOD_MUTATE_ROWS);
+    this.checkAndMutateRpc =
+        asyncUtilities.createAsyncUnaryRpc(BigtableServiceGrpc.METHOD_CHECK_AND_MUTATE_ROW);
+    this.readWriteModifyRpc =
+        asyncUtilities.createAsyncUnaryRpc(BigtableServiceGrpc.METHOD_READ_MODIFY_WRITE_ROW);
   }
 
   @Override
   public Empty mutateRow(MutateRowRequest request) throws ServiceException {
-    return clientCallService.blockingUnaryCall(createMutateRowCall(request), request);
+    return performBlockingRpc(request, IS_RETRYABLE_MUTATION, mutateRowRpc);
+  }
+
+  @Override
+  public ListenableFuture<Empty> addMutationRetry(ListenableFuture<Empty> future,
+      MutateRowRequest request) {
+    if (retryOptions.enableRetries()) {
+      RetryingRpcFunction<MutateRowRequest, Empty> retryingRpcFunction =
+          new RetryingRpcFunction<>(
+              retryOptions,
+              request,
+              mutateRowRpc,
+              IS_RETRYABLE_MUTATION,
+              retryExecutorService,
+              null);
+      return retryingRpcFunction.addRetry(future);
+    } else {
+      return mutateRowRpc.call(request, null);
+    }
   }
 
   @Override
   public ListenableFuture<Empty> mutateRowAsync(MutateRowRequest request) {
-    return clientCallService.listenableAsyncCall(createMutateRowCall(request), request);
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
+    return performRetryingAsyncRpc(request, mutateRowRpc, IS_RETRYABLE_MUTATION, null);
+  }
+
+  @Override
+  public MutateRowsResponse mutateRows(MutateRowsRequest request) throws ServiceException {
+    return performBlockingRpc(request, ARE_RETRYABLE_MUTATIONS, mutateRowsRpc);
+  }
+
+  @Override
+  public ListenableFuture<MutateRowsResponse> mutateRowsAsync(MutateRowsRequest request) {
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
+    return performRetryingAsyncRpc(request, mutateRowsRpc, ARE_RETRYABLE_MUTATIONS, null);
   }
 
   @Override
   public CheckAndMutateRowResponse checkAndMutateRow(CheckAndMutateRowRequest request)
       throws ServiceException {
-    return clientCallService.blockingUnaryCall(createCheckAndMutateRowCall(request), request);
+    return performBlockingRpc(request, IS_RETRYABLE_CHECK_AND_MUTATE, checkAndMutateRpc);
   }
 
   @Override
   public ListenableFuture<CheckAndMutateRowResponse> checkAndMutateRowAsync(
       CheckAndMutateRowRequest request) {
-    return clientCallService.listenableAsyncCall(createCheckAndMutateRowCall(request), request);
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
+    return performRetryingAsyncRpc(request, checkAndMutateRpc, IS_RETRYABLE_CHECK_AND_MUTATE, null);
   }
 
-  private ClientCall<MutateRowRequest, Empty> createMutateRowCall(MutateRowRequest request) {
-    return createRetryableCall(BigtableServiceGrpc.METHOD_MUTATE_ROW,
-      IS_RETRYABLE_MUTATION, request);
+  private <ReqT, RespT> RespT performBlockingRpc(ReqT request, Predicate<ReqT> retryablePredicate,
+      BigtableAsyncRpc<ReqT, RespT> rpc) {
+    CancellationToken token = new CancellationToken();
+    try {
+      return getUnchecked(performRetryingAsyncRpc(request, rpc, retryablePredicate, token));
+    } catch (Throwable t) {
+      token.cancel();
+      throw Throwables.propagate(t);
+    }
   }
 
-  private ClientCall<CheckAndMutateRowRequest, CheckAndMutateRowResponse>
-      createCheckAndMutateRowCall(CheckAndMutateRowRequest request) {
-    return createRetryableCall(BigtableServiceGrpc.METHOD_CHECK_AND_MUTATE_ROW,
-      IS_RETRYABLE_CHECK_AND_MUTATE, request);
+  /**
+   * Returns the result of calling {@link Future#get()} interruptably on a task known not to throw a
+   * checked exception.
+   *
+   * <p>If interrupted, the interrupt is restored before throwing an exception..
+   *
+   * @throws java.util.concurrent.CancellationException
+   *     if {@code get} throws a {@code CancellationException}.
+   * @throws io.grpc.StatusRuntimeException if {@code get} throws an {@link ExecutionException}
+   *     or an {@link InterruptedException}.
+   *
+   * @see ClientCalls#getUnchecked(Future)
+   */
+  private static <V> V getUnchecked(Future<V> future) {
+    try {
+      return future.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw Status.CANCELLED.withCause(e).asRuntimeException();
+    } catch (ExecutionException e) {
+      throw Status.fromThrowable(e).asRuntimeException();
+    }
   }
 
-  private <ReqT, RespT> ClientCall<ReqT, RespT> createRetryableCall(
-      MethodDescriptor<ReqT, RespT> method, Predicate<ReqT> isRetryable, ReqT request) {
-    if (retryOptions.enableRetries() && isRetryable.apply(request)) {
-      return new RetryingCall<ReqT, RespT>(channelPool, method, CallOptions.DEFAULT,
-          retryExecutorService, retryOptions);
+  private <ReqT, RespT> ListenableFuture<RespT> performRetryingAsyncRpc(ReqT request,
+      BigtableAsyncRpc<ReqT, RespT> rpc, Predicate<ReqT> isRetryable,
+      CancellationToken cancellationToken) {
+    if (retryOptions.enableRetries()) {
+      RetryingRpcFunction<ReqT, RespT> retryingRpcFunction =
+          new RetryingRpcFunction<>(
+              retryOptions, request, rpc, isRetryable, retryExecutorService, cancellationToken);
+      return retryingRpcFunction.callRpcWithRetry();
     } else {
-      return channelPool.newCall(method, CallOptions.DEFAULT);
+      if (retryOptions.enableRetries()) {
+        // Do not retry the call despite retries being enabled. The call is not idempontent and
+        // retrying it could cause unexpected behavior.
+        // Only log for powers of two to avoid spam.
+        int count = LOG_COUNT.incrementAndGet();
+        if ((count & (count - 1)) == 0) {
+          LOG.info("Retries configured for non-retryiable request. Not retrying. "
+              + "In future releases this case will fail.");
+        }
+      }
+      return rpc.call(request, cancellationToken);
     }
   }
 
   @Override
   public Row readModifyWriteRow(ReadModifyWriteRowRequest request) {
-    return clientCallService.blockingUnaryCall(
-      channelPool.newCall(BigtableServiceGrpc.METHOD_READ_MODIFY_WRITE_ROW, CallOptions.DEFAULT),
-      request);
+    CancellationToken token = new CancellationToken();
+    try {
+      return getUnchecked(readWriteModifyRpc.call(request, token));
+    } catch (Throwable t) {
+      token.cancel();
+      throw Throwables.propagate(t);
+    }
   }
 
   @Override
   public ListenableFuture<Row> readModifyWriteRowAsync(ReadModifyWriteRowRequest request) {
-    return clientCallService.listenableAsyncCall(
-      channelPool.newCall(BigtableServiceGrpc.METHOD_READ_MODIFY_WRITE_ROW, CallOptions.DEFAULT),
-      request);
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
+    return readWriteModifyRpc.call(request, null);
   }
 
   @Override
   public ImmutableList<SampleRowKeysResponse> sampleRowKeys(SampleRowKeysRequest request) {
     return ImmutableList
-        .copyOf(clientCallService.blockingServerStreamingCall(
-          channelPool.newCall(BigtableServiceGrpc.METHOD_SAMPLE_ROW_KEYS, CallOptions.DEFAULT),
-          request));
+        .copyOf(performBlockingRpc(request, IS_RETRYABLE_SAMPLE_ROW_KEY, sampleRowKeysAsync));
   }
 
   @Override
-  public ListenableFuture<List<SampleRowKeysResponse>> sampleRowKeysAsync(
-      SampleRowKeysRequest request) {
-    return BigtableAsyncUtilities.doReadAsync(retryOptions, request, sampleRowKeysAsync,
-      executorService);
+  public ListenableFuture<List<SampleRowKeysResponse>>
+      sampleRowKeysAsync(SampleRowKeysRequest request) {
+    return performRetryingAsyncRpc(request, sampleRowKeysAsync, IS_RETRYABLE_SAMPLE_ROW_KEY, null);
   }
 
   @Override
-  public ListenableFuture<List<Row>> readRowsAsync(final ReadRowsRequest request) {
-    return BigtableAsyncUtilities
-        .doReadAsync(retryOptions, request, readRowsAsync, executorService);
+  public ListenableFuture<List<Row>> readRowsAsync(ReadRowsRequest request) {
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
+    return performRetryingAsyncRpc(request, readRowsAsync, IS_RETRYABLE_READ_ROW, null);
   }
 
   @Override
@@ -230,34 +335,26 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
   }
 
   private ResultScanner<Row> streamRows(ReadRowsRequest request) {
+    expandPoolIfNecessary(this.bigtableOptions.getChannelCount());
     boolean isGet = request.getTargetCase() == ReadRowsRequest.TargetCase.ROW_KEY;
 
     int streamingBufferSize;
-
     int batchRequestSize;
-
-    // If it's a long running scan, reserve the pool. There is a gRPC bug that makes the Channel
-    // unavailable for other streams. Reserve a channel for now. Reservations can probably be
-    // removed once we use gRPC 0.10.0. See https://github.com/grpc/grpc-java/issues/1175 for more
-    // details
-    Channel channel;
 
     if (isGet) {
       // Batch request size is more performant with a value of 1 for single row gets, while a higher
       // number is more performant for scanning
       batchRequestSize = 1;
       streamingBufferSize = 10;
-      channel = channelPool;
     } else {
       batchRequestSize = retryOptions.getStreamingBatchSize();
       streamingBufferSize = retryOptions.getStreamingBufferSize();
-      channel = channelPool.reserveChannel();
     }
 
     ClientCall<ReadRowsRequest, ReadRowsResponse> readRowsCall =
-        channel.newCall(BigtableServiceGrpc.METHOD_READ_ROWS, CallOptions.DEFAULT);
+        channelPool.newCall(BigtableServiceGrpc.METHOD_READ_ROWS, CallOptions.DEFAULT);
 
-    CancellationToken cancellationToken = createCancellationToken(channel, readRowsCall);
+    CancellationToken cancellationToken = createCancellationToken(readRowsCall);
 
     int timeout = retryOptions.getReadPartialRowTimeoutMillis();
 
@@ -268,10 +365,10 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
     StreamingBigtableResultScanner resultScanner =
         new StreamingBigtableResultScanner(responseQueueReader, cancellationToken);
 
-    clientCallService.asyncServerStreamingCall(
+    asyncUtilities.asyncServerStreamingCall(
         readRowsCall,
         request,
-        createClientCallListener(channel, resultScanner));
+        createClientCallListener(resultScanner));
 
     if (batchRequestSize > 1) {
       readRowsCall.request(batchRequestSize - 1);
@@ -280,22 +377,20 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
     return resultScanner;
   }
 
-  private CancellationToken createCancellationToken(final Channel channel,
-      final ClientCall<ReadRowsRequest, ReadRowsResponse> readRowsCall) {
+  private CancellationToken createCancellationToken(final ClientCall<ReadRowsRequest, ReadRowsResponse> readRowsCall) {
     // If the scanner is closed before we're done streaming, we want to cancel the RPC.
     CancellationToken cancellationToken = new CancellationToken();
     cancellationToken.addListener(new Runnable() {
       @Override
       public void run() {
-        returnToPool(channel);
         readRowsCall.cancel();
       }
-    }, executorService);
+    }, MoreExecutors.directExecutor());
     return cancellationToken;
   }
 
-  private ClientCall.Listener<ReadRowsResponse> createClientCallListener(
-      final Channel channel, final StreamingBigtableResultScanner resultScanner) {
+  private ClientCall.Listener<ReadRowsResponse>
+      createClientCallListener(final StreamingBigtableResultScanner resultScanner) {
     return new ClientCall.Listener<ReadRowsResponse>() {
       @Override
       public void onMessage(ReadRowsResponse readRowResponse) {
@@ -304,7 +399,6 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
 
       @Override
       public void onClose(Status status, Metadata trailers) {
-        returnToPool(channel);
         if (status.isOk()) {
           resultScanner.complete();
         } else {
@@ -314,10 +408,11 @@ public class BigtableDataGrpcClient implements BigtableDataClient {
     };
   }
 
-  private void returnToPool(Channel channel) {
-    // When channel is not channelPool, we are using a PooledChannel.
-    if (channel != channelPool) {
-      ((PooledChannel) channel).returnToPool();
+  private void expandPoolIfNecessary(int channelCount) {
+    try {
+      this.channelPool.ensureChannelCount(channelCount);
+    } catch (IOException e) {
+      LOG.info("Could not expand the channel pool.", e);
     }
   }
 }

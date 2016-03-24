@@ -53,7 +53,6 @@ public class TestIncrement extends AbstractTest {
    * Requirement 6.4 - Return post-increment value(s)
    */
   @Test
-  @Category(KnownGap.class)
   public void testIncrement() throws IOException {
     // Initialize data
     try (Table table = getConnection().getTable(TABLE_NAME)){
@@ -284,7 +283,7 @@ public class TestIncrement extends AbstractTest {
 
   @Test
   @Category(KnownGap.class)
-  public void testIncrementWithMaxVersions() throws IOException, InterruptedException {
+  public void testIncrementWithMaxVersions() throws IOException {
     // Initialize data
     byte[] incrementFamily = Bytes.toBytes("i");
     byte[] incrementTable = Bytes.toBytes("increment_table");

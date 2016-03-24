@@ -30,7 +30,7 @@ import com.google.cloud.bigtable.config.BigtableOptions;
 import com.google.cloud.bigtable.hbase.BigtableOptionsFactory;
 
 /**
- * This class defines information that a Cloud Bigtable client needs to connect to a user's Cloud
+ * This class defines configuration that a Cloud Bigtable client needs to connect to a Cloud
  * Bigtable cluster.
  */
 public class CloudBigtableConfiguration implements Serializable {
@@ -60,7 +60,7 @@ public class CloudBigtableConfiguration implements Serializable {
     /**
      * Specifies the project ID for the Cloud Bigtable cluster.
      * @param projectId The project ID for the cluster.
-     * @return The original {@link CloudBigtableConfiguration.Builder} for chaining convenience.
+     * @return The {@link CloudBigtableConfiguration.Builder} for chaining convenience.
      */
     public Builder withProjectId(String projectId) {
       this.projectId = projectId;
@@ -70,7 +70,7 @@ public class CloudBigtableConfiguration implements Serializable {
     /**
      * Specifies the zone where the Cloud Bigtable cluster is located.
      * @param zoneId The zone where the cluster is located.
-     * @return The original {@link CloudBigtableConfiguration.Builder} for chaining convenience.
+     * @return The {@link CloudBigtableConfiguration.Builder} for chaining convenience.
      */
     public Builder withZoneId(String zoneId) {
       this.zoneId = zoneId;
@@ -80,7 +80,7 @@ public class CloudBigtableConfiguration implements Serializable {
     /**
      * Specifies the cluster ID for the Cloud Bigtable cluster.
      * @param clusterId The cluster ID for the cluster.
-     * @return The original {@link CloudBigtableConfiguration.Builder} for chaining convenience.
+     * @return The {@link CloudBigtableConfiguration.Builder} for chaining convenience.
      */
     public Builder withClusterId(String clusterId) {
       this.clusterId = clusterId;
@@ -88,9 +88,10 @@ public class CloudBigtableConfiguration implements Serializable {
     }
 
     /**
-     * Add additional connection configuration.
+     * Adds additional connection configuration.
      * {@link BigtableOptionsFactory#fromConfiguration(Configuration)} for more information about
      * configuration options.
+     * @return The {@link CloudBigtableConfiguration.Builder} for chaining convenience.
      */
     public Builder withConfiguration(String key, String value) {
       Preconditions.checkArgument(value != null, "Value cannot be null");
@@ -120,9 +121,9 @@ public class CloudBigtableConfiguration implements Serializable {
    * @param projectId The project ID for the cluster.
    * @param zoneId The zone where the cluster is located.
    * @param clusterId The cluster ID for the cluster.
-   * @param additionalConfiguration A Map with additional connection configuration.
-   *          {@link BigtableOptionsFactory#fromConfiguration(Configuration)} for more information
-   *          about configuration options.
+   * @param additionalConfiguration A {@link Map} with additional connection configuration.
+   *          See {@link BigtableOptionsFactory#fromConfiguration(Configuration)} for more
+   *          information about configuration options.
    */
   public CloudBigtableConfiguration(String projectId, String zoneId, String clusterId,
       Map<String, String> additionalConfiguration) {
@@ -133,9 +134,8 @@ public class CloudBigtableConfiguration implements Serializable {
   }
 
   private void setValue(String key, String value, String type) {
-    Preconditions.checkArgument(!configuration.containsKey(key),
-      String.format("%s was set twice", key));
-    Preconditions.checkArgument(value != null, String.format("%s must be set.", type));
+    Preconditions.checkArgument(!configuration.containsKey(key), "%s was set twice", key);
+    Preconditions.checkArgument(value != null, "%s must be set.", type);
     configuration.put(key, value);
   }
 
@@ -176,7 +176,14 @@ public class CloudBigtableConfiguration implements Serializable {
    * @return The {@link Configuration}.
    */
   public Configuration toHBaseConfig() {
-    Configuration config = new Configuration();
+    Configuration config = new Configuration(false);
+
+    // This setting can potentially decrease performance for large scale writes. However, this
+    // setting prevents problems that occur when streaming Sources, such as PubSub, are used.
+    // To override this behavior, call:
+    //    Builder.withConfiguration(BigtableOptionsFactory.BIGTABLE_ASYNC_MUTATOR_COUNT_KEY, 
+    //                              BigtableOptions.BIGTABLE_ASYNC_MUTATOR_COUNT_DEFAULT);
+    config.set(BigtableOptionsFactory.BIGTABLE_ASYNC_MUTATOR_COUNT_KEY, "0");
     for (Entry<String, String> entry : configuration.entrySet()) {
       config.set(entry.getKey(), entry.getValue());
     }
@@ -184,20 +191,26 @@ public class CloudBigtableConfiguration implements Serializable {
   }
 
   /**
-   * Creates a new Builder from the configuration
-   * @return A new {@link Builder}
+   * Creates a new {@link Builder} object containing the existing configuration.
+   * @return A new {@link Builder}.
    */
   public Builder toBuilder() {
     return new Builder(getConfiguration());
   }
 
   /**
-   * Returns an unmodifiable copy of the configuration map.
+   * Gets an immutable copy of the configuration map.
    */
-  protected Map<String, String> getConfiguration() {
+  protected ImmutableMap<String, String> getConfiguration() {
     return ImmutableMap.copyOf(configuration);
   }
 
+  /**
+   * Compares this configuration with the specified object.
+   * @param obj The object to compare this configuration against.
+   * @return {@code true} if the given object has the same configuration, {@code false} otherwise.
+   */
+  @Override
   public boolean equals(Object obj) {
     if (obj == null || obj.getClass() != this.getClass()) {
       return false;

@@ -22,6 +22,7 @@ import com.google.api.client.util.Preconditions;
 import com.google.api.client.util.Sleeper;
 import com.google.bigtable.v1.ReadRowsRequest;
 import com.google.bigtable.v1.Row;
+import com.google.bigtable.v1.RowSet;
 import com.google.cloud.bigtable.config.Logger;
 import com.google.cloud.bigtable.config.RetryOptions;
 import com.google.cloud.bigtable.grpc.io.IOExceptionWithStatus;
@@ -31,6 +32,9 @@ import com.google.protobuf.ByteString;
 import io.grpc.Status;
 
 import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 /**
@@ -42,7 +46,52 @@ public class ResumingStreamingResultScanner extends AbstractBigtableResultScanne
   private static final Logger LOG = new Logger(ResumingStreamingResultScanner.class);
 
   private static final ByteString NEXT_ROW_SUFFIX = ByteString.copyFrom(new byte[]{0x00});
-  private final BigtableResultScannerFactory scannerFactory;
+
+  private interface RequestRestarter {
+    void found(ByteString key);
+
+    void updateRequest(ReadRowsRequest.Builder newRequest);
+  }
+
+  private static class RowRangeRequestRestarter implements RequestRestarter {
+    private ByteString lastRowKey = null;
+
+    @Override
+    public void found(ByteString key) {
+      lastRowKey = key;
+    }
+
+    @Override
+    public void updateRequest(ReadRowsRequest.Builder newRequest) {
+      if (lastRowKey != null) {
+        newRequest.getRowRangeBuilder().setStartKey(nextRowKey(lastRowKey));
+      }
+    }
+  }
+
+  private static class SingleRowRequestRestarter implements RequestRestarter {
+    @Override
+    public void found(ByteString key) {
+    }
+
+    @Override
+    public void updateRequest(ReadRowsRequest.Builder newRequest) {
+    }
+  }
+
+  private static class RowSetRequestRestarter implements RequestRestarter {
+    private Set<ByteString> foundKeys = new HashSet<>();
+    @Override
+    public void found(ByteString key) {
+      foundKeys.add(key);
+    }
+    @Override
+    public void updateRequest(ReadRowsRequest.Builder newRequest) {
+      Set<ByteString> allRowKeys = new HashSet<>(newRequest.getRowSet().getRowKeysList());
+      allRowKeys.removeAll(foundKeys);
+      newRequest.setRowSet(RowSet.newBuilder().addAllRowKeys(allRowKeys));
+    }
+  }
 
   /**
    * Construct a ByteString containing the next possible row key.
@@ -51,15 +100,18 @@ public class ResumingStreamingResultScanner extends AbstractBigtableResultScanne
     return previous.concat(NEXT_ROW_SUFFIX);
   }
 
+  private final BigtableResultScannerFactory scannerFactory;
   private final ReadRowsRequest originalRequest;
   private final RetryOptions retryOptions;
+  private final RequestRestarter restarter;
 
-  private BackOff currentBackoff;
+  private BackOff currentErrorBackoff;
   private ResultScanner<Row> currentDelegate;
-  private ByteString lastRowKey = null;
   private Sleeper sleeper = Sleeper.DEFAULT;
   // The number of rows read so far.
   private long rowCount = 0;
+  // The number of times we've retried after a timeout
+  private AtomicInteger timeoutRetryCount = new AtomicInteger();
 
   private final Logger logger;
 
@@ -76,14 +128,27 @@ public class ResumingStreamingResultScanner extends AbstractBigtableResultScanne
       ReadRowsRequest originalRequest,
       BigtableResultScannerFactory scannerFactory,
       Logger logger) {
-    Preconditions.checkArgument(
-        !originalRequest.getAllowRowInterleaving(),
-        "Row interleaving is not supported when using resumable streams");
     this.originalRequest = originalRequest;
     this.scannerFactory = scannerFactory;
     this.currentDelegate = scannerFactory.createScanner(originalRequest);
     this.retryOptions = retryOptions;
     this.logger = logger;
+    switch(originalRequest.getTargetCase()) {
+    case ROW_SET:
+      restarter = new RowSetRequestRestarter();
+      break;
+    case ROW_RANGE:
+      Preconditions.checkArgument(
+        !originalRequest.getAllowRowInterleaving(),
+        "Row interleaving is not supported when using resumable streams");
+      restarter = new RowRangeRequestRestarter();
+      break;
+    case ROW_KEY:
+      restarter = new SingleRowRequestRestarter();
+      break;
+    default:
+      throw new IllegalStateException("Cannot handle: "+originalRequest.getTargetCase());
+    }
   }
 
   @Override
@@ -92,53 +157,66 @@ public class ResumingStreamingResultScanner extends AbstractBigtableResultScanne
       try {
         Row result = currentDelegate.next();
         if (result != null) {
-          lastRowKey = result.getKey();
+          restarter.found(result.getKey());
           rowCount++;
+          // We've had at least one successful RPC, reset the backoff and retry counter
+          currentErrorBackoff = null;
+          timeoutRetryCount = null;
         }
-        // We've had at least one successful RPC, reset the backoff
-        currentBackoff = null;
 
         return result;
       } catch (ScanTimeoutException rte) {
-        logger.info("The client could not get a repsone in %d ms.  Retrying the scan.",
-          retryOptions.getReadPartialRowTimeoutMillis());
-        backOffAndRetry(rte);
+        handleScanTimeout(rte);
       } catch (IOExceptionWithStatus ioe) {
-        Status.Code code = ioe.getStatus().getCode();
-        if (retryOptions.isRetryableRead(code)) {
-          logger.info("Reissuing scan after receiving error with status: %s.", code.name());
-          backOffAndRetry(ioe);
-        } else {
-          throw ioe;
-        }
+        handleIOException(ioe);
       }
+    }
+  }
+
+  private void handleScanTimeout(ScanTimeoutException rte) throws IOException {
+    logger.info("The client could not get a response in %d ms. Retrying the scan.",
+      retryOptions.getReadPartialRowTimeoutMillis());
+
+    if (timeoutRetryCount == null) {
+      timeoutRetryCount = new AtomicInteger();
+    }
+
+    // Reset the error backoff in case we encountered this timeout after an error.
+    // Otherwise, we will likely have already exceeded the max elapsed time for the backoff
+    // and won't retry after the next error.
+    currentErrorBackoff = null;
+
+    if (timeoutRetryCount.incrementAndGet() <= retryOptions.getMaxScanTimeoutRetries()) {
+      reissueRequest();
+    }
+    else {
+      throw new BigtableRetriesExhaustedException(
+          "Exhausted streaming retries after too many timeouts", rte);
+    }
+  }
+
+  private void handleIOException(IOExceptionWithStatus ioe) throws IOException {
+    Status.Code code = ioe.getStatus().getCode();
+    if (retryOptions.isRetryable(code)) {
+      logger.info("Reissuing scan after receiving error with status: %s.", ioe, code.name());
+      if (currentErrorBackoff == null) {
+        currentErrorBackoff = retryOptions.createBackoff();
+      }
+      long nextBackOffMillis = currentErrorBackoff.nextBackOffMillis();
+      if (nextBackOffMillis == BackOff.STOP) {
+        throw new BigtableRetriesExhaustedException("Exhausted streaming retries.", ioe);
+      }
+
+      sleep(nextBackOffMillis);
+      reissueRequest();
+    } else {
+      throw ioe;
     }
   }
 
   @Override
   public int available() {
     return currentDelegate.available();
-  }
-
-  /**
-   * Backs off and reissues request.
-   *
-   * @param cause
-   * @throws IOException
-   * @throws ScanRetriesExhaustedException if retry is exhausted.
-   */
-  private void backOffAndRetry(IOException cause) throws IOException,
-      ScanRetriesExhaustedException {
-    if (currentBackoff == null) {
-      currentBackoff = retryOptions.createBackoff();
-    }
-    long nextBackOff = currentBackoff.nextBackOffMillis();
-    if (nextBackOff == BackOff.STOP) {
-      throw new ScanRetriesExhaustedException("Exhausted streaming retries.", cause);
-    }
-
-    sleep(nextBackOff);
-    reissueRequest();
   }
 
   @Override
@@ -154,9 +232,7 @@ public class ResumingStreamingResultScanner extends AbstractBigtableResultScanne
     }
 
     ReadRowsRequest.Builder newRequest = originalRequest.toBuilder();
-    if (lastRowKey != null) {
-      newRequest.getRowRangeBuilder().setStartKey(nextRowKey(lastRowKey));
-    }
+    restarter.updateRequest(newRequest);
 
     // If the row limit is set, update it.
     long numRowsLimit = newRequest.getNumRowsLimit();

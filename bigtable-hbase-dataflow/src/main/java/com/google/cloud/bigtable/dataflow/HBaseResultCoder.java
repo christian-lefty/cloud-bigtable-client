@@ -18,7 +18,6 @@ package com.google.cloud.bigtable.dataflow;
 import com.google.cloud.dataflow.sdk.coders.AtomicCoder;
 import com.google.cloud.dataflow.sdk.coders.Coder;
 import com.google.cloud.dataflow.sdk.coders.CoderException;
-import com.google.cloud.dataflow.sdk.io.Source;
 
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
@@ -30,11 +29,18 @@ import java.io.OutputStream;
 import java.io.Serializable;
 
 /**
- * A {@link Coder} that serializes {@link Result} objects used by the Cloud Bigtable {@link Source}.
+ * A {@link Coder} that serializes and deserializes the {@link Result} objects using {@link
+ * ProtobufUtil}.
  */
-public class HBaseResultCoder extends AtomicCoder<Result> implements Serializable{
+public class HBaseResultCoder extends AtomicCoder<Result> implements Serializable {
 
   private static final long serialVersionUID = -4975428837770254686L;
+
+  private static final HBaseResultCoder INSTANCE = new HBaseResultCoder();
+
+  public static HBaseResultCoder getInstance() {
+    return INSTANCE;
+  }
 
   @Override
   public Result decode(InputStream inputStream, Coder.Context context)
@@ -43,8 +49,8 @@ public class HBaseResultCoder extends AtomicCoder<Result> implements Serializabl
   }
 
   @Override
-  public void encode(Result value, OutputStream outputStream,
-      Coder.Context context) throws CoderException, IOException {
+  public void encode(Result value, OutputStream outputStream, Coder.Context context)
+      throws CoderException, IOException {
     ProtobufUtil.toResult(value).writeDelimitedTo(outputStream);
   }
 }

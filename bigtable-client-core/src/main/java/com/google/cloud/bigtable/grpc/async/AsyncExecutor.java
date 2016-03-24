@@ -21,6 +21,8 @@ import java.util.List;
 import com.google.bigtable.v1.CheckAndMutateRowRequest;
 import com.google.bigtable.v1.CheckAndMutateRowResponse;
 import com.google.bigtable.v1.MutateRowRequest;
+import com.google.bigtable.v1.MutateRowsRequest;
+import com.google.bigtable.v1.MutateRowsResponse;
 import com.google.bigtable.v1.ReadModifyWriteRowRequest;
 import com.google.bigtable.v1.ReadRowsRequest;
 import com.google.bigtable.v1.Row;
@@ -32,7 +34,7 @@ import com.google.protobuf.Empty;
 import com.google.protobuf.GeneratedMessage;
 
 /**
- * This class provides management of asynchronous Bigtable RPCs.  It ensures that there aren't too
+ * This class provides management of asynchronous Bigtable RPCs. It ensures that there aren't too
  * many concurrent, in flight asynchronous RPCs and also makes sure that the memory used by the
  * requests doesn't exceed a threshold.
  */
@@ -42,8 +44,9 @@ public class AsyncExecutor {
   public static final int MAX_INFLIGHT_RPCS_DEFAULT = 50;
 
   // This is the maximum accumulated size of uncompleted requests that we allow before throttling.
-  // Default to 32MB.
-  public static final long ASYNC_MUTATOR_MAX_MEMORY_DEFAULT = 16 * 2097152;
+  // Default to 10% of available memory with a max of 1GB.
+  public static final long ASYNC_MUTATOR_MAX_MEMORY_DEFAULT =
+      (long) Math.min(1 << 30, (Runtime.getRuntime().maxMemory() * 0.1d));
 
   protected static final Logger LOG = new Logger(AsyncExecutor.class);
 
@@ -51,7 +54,10 @@ public class AsyncExecutor {
     ListenableFuture<ResponseT> call(BigtableDataClient client, RequestT request);
   }
 
-  protected static AsyncCall<MutateRowRequest, Empty> MUTATE_ASYNC =
+  /**
+   * Calls {@link BigtableDataClient#mutateRowAsync(MutateRowRequest)}.
+   */
+  protected static AsyncCall<MutateRowRequest, Empty> MUTATE_ROW_ASYNC =
       new AsyncCall<MutateRowRequest, Empty>() {
         @Override
         public ListenableFuture<Empty> call(BigtableDataClient client, MutateRowRequest request) {
@@ -59,6 +65,21 @@ public class AsyncExecutor {
         }
       };
 
+  /**
+   * Calls {@link BigtableDataClient#mutateRowsAsync(MutateRowsRequest)}.
+   */
+  protected static AsyncCall<MutateRowsRequest, MutateRowsResponse> MUTATE_ROWS_ASYNC =
+      new AsyncCall<MutateRowsRequest, MutateRowsResponse>() {
+        @Override
+        public ListenableFuture<MutateRowsResponse> call(BigtableDataClient client,
+            MutateRowsRequest request) {
+          return client.mutateRowsAsync(request);
+        }
+      };
+
+  /**
+   * Calls {@link BigtableDataClient#readModifyWriteRowAsync(ReadModifyWriteRowRequest)}.
+   */
   protected static AsyncCall<ReadModifyWriteRowRequest, Row> READ_MODIFY_WRITE_ASYNC =
       new AsyncCall<ReadModifyWriteRowRequest, Row>() {
         @Override
@@ -68,6 +89,9 @@ public class AsyncExecutor {
         }
       };
 
+  /**
+   * Calls {@link BigtableDataClient#checkAndMutateRowAsync(CheckAndMutateRowRequest)}.
+   */
   protected static AsyncCall<CheckAndMutateRowRequest, CheckAndMutateRowResponse> CHECK_AND_MUTATE_ASYNC =
       new AsyncCall<CheckAndMutateRowRequest, CheckAndMutateRowResponse>() {
         @Override
@@ -77,6 +101,9 @@ public class AsyncExecutor {
         }
       };
 
+  /**
+   * Calls {@link BigtableDataClient#readRowsAsync(ReadRowsRequest)}.
+   */
   protected static AsyncCall<ReadRowsRequest, List<Row>> READ_ROWS_ASYNC =
       new AsyncCall<ReadRowsRequest, List<Row>>() {
         @Override
@@ -86,29 +113,156 @@ public class AsyncExecutor {
       };
 
   private final BigtableDataClient client;
-  private final HeapSizeManager sizeManager;
+  private final RpcThrottler sizeManager;
 
-  public AsyncExecutor(BigtableDataClient client, HeapSizeManager heapSizeManager) {
+  public AsyncExecutor(BigtableDataClient client, RpcThrottler rpcThrottler) {
     this.client = client;
-    this.sizeManager = heapSizeManager;
+    this.sizeManager = rpcThrottler;
   }
 
+  /**
+   * Performs a {@link BigtableDataClient#mutateRowAsync(MutateRowRequest)} on the
+   * {@link MutateRowRequest} given an operationId generated from
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)}.
+   *
+   * @param request The {@link MutateRowRequest} to send.
+   * @param operationId The Id generated from
+   *          {@link RpcThrottler#registerOperationWithHeapSize(long)} that will be released when
+   *          the mutate operation is completed.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<Empty> mutateRowAsync(MutateRowRequest request, long operationId) {
+    return call(MUTATE_ROW_ASYNC, request, operationId);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#mutateRowsAsync(MutateRowsRequest)} on the
+   * {@link MutateRowsRequest} given an operationId generated from
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)}.
+   *
+   * @param request The {@link MutateRowsRequest} to send.
+   * @param operationId The Id generated from
+   *          {@link RpcThrottler#registerOperationWithHeapSize(long)} that will be released when
+   *          the mutate operation is completed.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<MutateRowsResponse> mutateRowAsync(MutateRowsRequest request, long operationId) {
+    return call(MUTATE_ROWS_ASYNC, request, operationId);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#checkAndMutateRowAsync(CheckAndMutateRowRequest)} on the
+   * {@link CheckAndMutateRowRequest} given an operationId generated from
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)}.
+   *
+   * @param request The {@link CheckAndMutateRowRequest} to send.
+   * @param operationId The Id generated from
+   *          {@link RpcThrottler#registerOperationWithHeapSize(long)} that will be released when
+   *          the checkAndMutateRow operation is completed.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<CheckAndMutateRowResponse> checkAndMutateRowAsync(
+      CheckAndMutateRowRequest request, long operationId) {
+    return call(CHECK_AND_MUTATE_ASYNC, request, operationId);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#readModifyWriteRowAsync(ReadModifyWriteRowRequest)} on the
+   * {@link ReadModifyWriteRowRequest} given an operationId generated from
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)}.
+   *
+   * @param request The {@link ReadModifyWriteRowRequest} to send.
+   * @param operationId The Id generated from
+   *          {@link RpcThrottler#registerOperationWithHeapSize(long)} that will be released when
+   *          the readModifyWriteRowAsync operation is completed.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<Row> readModifyWriteRowAsync(ReadModifyWriteRowRequest request,
+      long operationId)  {
+    return call(READ_MODIFY_WRITE_ASYNC, request, operationId);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#readRowsAsync(ReadRowsRequest)} on the
+   * {@link ReadRowsRequest} given an operationId generated from
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)}.
+   *
+   * @param request The {@link ReadRowsRequest} to send.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<List<Row>> readRowsAsync(ReadRowsRequest request, long operationId) {
+    return call(READ_ROWS_ASYNC, request, operationId);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#mutateRowAsync(MutateRowRequest)} on the
+   * {@link MutateRowRequest}. This method may block if
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)} blocks.
+   *
+   * @param request The {@link MutateRowRequest} to send.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
   public ListenableFuture<Empty> mutateRowAsync(MutateRowRequest request)
       throws InterruptedException {
-    return call(MUTATE_ASYNC, request);
+    return call(MUTATE_ROW_ASYNC, request);
   }
 
+  /**
+   * Performs a {@link BigtableDataClient#mutateRowsAsync(MutateRowsRequest)} on the
+   * {@link MutateRowsRequest}. This method may block if
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)} blocks.
+   * @param request The {@link MutateRowRequest} to send.
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<MutateRowsResponse> mutateRowsAsync(MutateRowsRequest request)
+      throws InterruptedException {
+    return call(MUTATE_ROWS_ASYNC, request);
+  }
+
+  /**
+   * Performs a {@link BigtableDataClient#checkAndMutateRowAsync(CheckAndMutateRowRequest)} on the
+   * {@link CheckAndMutateRowRequest}. This method may block if
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)} blocks.
+   *
+   * @param request The {@link CheckAndMutateRowRequest} to send.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
   public ListenableFuture<CheckAndMutateRowResponse> checkAndMutateRowAsync(
       CheckAndMutateRowRequest request) throws InterruptedException {
     return call(CHECK_AND_MUTATE_ASYNC, request);
   }
 
+  /**
+   * Performs a {@link BigtableDataClient#readModifyWriteRow(ReadModifyWriteRowRequest)} on the
+   * {@link ReadModifyWriteRowRequest}. This method may block if
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)} blocks.
+   *
+   * @param request The {@link ReadModifyWriteRowRequest} to send.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
   public ListenableFuture<Row> readModifyWriteRowAsync(ReadModifyWriteRowRequest request)
       throws InterruptedException {
     return call(READ_MODIFY_WRITE_ASYNC, request);
   }
 
-  public ListenableFuture<List<com.google.bigtable.v1.Row>> readRowsAsync(ReadRowsRequest request)
+  /**
+   * Performs a {@link BigtableDataClient#readRowsAsync(ReadRowsRequest)} on the
+   * {@link ReadRowsRequest}. This method may block if
+   * {@link RpcThrottler#registerOperationWithHeapSize(long)} blocks.
+   *
+   * @param request The {@link ReadRowsRequest} to send.
+   *
+   * @return a {@link ListenableFuture} which can be listened to for completion events.
+   */
+  public ListenableFuture<List<Row>> readRowsAsync(ReadRowsRequest request)
       throws InterruptedException {
     return call(READ_ROWS_ASYNC, request);
   }
@@ -118,6 +272,11 @@ public class AsyncExecutor {
     // Wait until both the memory and rpc count maximum requirements are achieved before getting a
     // unique id used to track this request.
     long id = sizeManager.registerOperationWithHeapSize(request.getSerializedSize());
+    return call(rpc, request, id);
+  }
+
+  private <ResponseT, RequestT extends GeneratedMessage> ListenableFuture<ResponseT>
+      call(AsyncCall<RequestT, ResponseT> rpc, RequestT request, long id) {
     ListenableFuture<ResponseT> future;
     try {
       future = rpc.call(client, request);
@@ -128,12 +287,19 @@ public class AsyncExecutor {
     return future;
   }
 
+  /**
+   * Waits until all operations managed by the {@link RpcThrottler} complete. See
+   * {@link RpcThrottler#awaitCompletion()} for more information.
+   *
+   * @throws IOException if something goes wrong.
+   */
   public void flush() throws IOException {
     LOG.trace("Flushing");
     try {
-      sizeManager.waitUntilAllOperationsAreDone();
+      sizeManager.awaitCompletion();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
+      throw new IOException("Batch operations were interrupted.");
     }
     LOG.trace("Done flushing");
   }
@@ -144,5 +310,14 @@ public class AsyncExecutor {
 
   public long getMaxHeapSize() {
     return sizeManager.getMaxHeapSize();
+  }
+
+  public BigtableDataClient getClient() {
+    return client;
+  }
+
+  public ListenableFuture<Empty> addMutationRetry(ListenableFuture<Empty> future,
+      MutateRowRequest request) {
+    return this.client.addMutationRetry(future, request);
   }
 }

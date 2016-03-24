@@ -20,7 +20,7 @@ limitations under the License.
     <parent>
         <groupId>com.google.cloud.bigtable</groupId>
         <artifactId>bigtable-client</artifactId>
-        <version>0.2.3-SNAPSHOT</version>
+        <version>0.2.5-SNAPSHOT</version>
     </parent>
 
     <artifactId>bigtable-hbase-1.1</artifactId>
@@ -31,7 +31,7 @@ limitations under the License.
     </description>
 
     <properties>
-        <hbase.version>1.1.1</hbase.version>
+        <hbase.version>1.1.2</hbase.version>
     </properties>
 
     <dependencies>
@@ -114,6 +114,7 @@ limitations under the License.
                             <createDependencyReducedPom>true</createDependencyReducedPom>
                             <artifactSet>
                                 <includes>
+                                    <include>com.fasterxml.jackson.core:*</include>
                                     <include>com.google.cloud.bigtable:bigtable-protos</include>
                                     <include>com.google.cloud.bigtable:bigtable-client-core</include>
                                     <include>com.google.cloud.bigtable:bigtable-hbase</include>
@@ -124,35 +125,46 @@ limitations under the License.
                                     <include>com.google.oauth-client:*</include>
                                     <include>com.google.protobuf:*</include>
                                     <include>com.twitter:hpack</include>
-                                    <include>com.fasterxml.jackson.core:*</include>
                                     <include>io.netty:*</include>
                                     <include>io.grpc:*</include>
                                 </includes>
                             </artifactSet>
                             <relocations>
                                 <relocation>
+                                    <pattern>com.fasterxml</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.com.faster.xml</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.api</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.com.google.api</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.auth</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.com.google.auth</shadedPattern>
+                                </relocation>
+                                <relocation>
                                     <pattern>com.google.common</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.com.google.common</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.thirdparty</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.com.google.thirdparty</shadedPattern>
                                 </relocation>
                                 <relocation>
                                     <pattern>com.google.protobuf</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.com.google.protobuf</shadedPattern>
                                 </relocation>
                                 <relocation>
-                                    <pattern>com.fasterxml</pattern>
-                                    <shadedPattern>com.google.bigtable.repackaged.com.fasterxml</shadedPattern>
+                                    <pattern>com.twitter</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.com.twitter</shadedPattern>
                                 </relocation>
                                 <relocation>
-                                    <pattern>org.apache.commons.codec</pattern>
-                                    <shadedPattern>com.google.bigtable.repackaged.org.apache.commons.codec</shadedPattern>
+                                    <pattern>io.grpc</pattern>
+                                    <shadedPattern>com.google.bigtable.repackaged.io.grpc</shadedPattern>
                                 </relocation>
                                 <relocation>
                                     <pattern>io.netty</pattern>
                                     <shadedPattern>com.google.bigtable.repackaged.io.netty</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.google.api</pattern>
-                                    <shadedPattern>com.google.bigtable.repackaged.com.google.api</shadedPattern>
                                 </relocation>
                             </relocations>
                         </configuration>

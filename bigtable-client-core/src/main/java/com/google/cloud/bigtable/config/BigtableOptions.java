@@ -15,36 +15,64 @@
  */
 package com.google.cloud.bigtable.config;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.api.client.util.Strings;
-import com.google.cloud.bigtable.grpc.BigtableClusterName;
-import com.google.common.base.Preconditions;
-
+import java.io.Serializable;
 import java.util.concurrent.TimeUnit;
+
+import com.google.api.client.util.Objects;
+import com.google.cloud.bigtable.grpc.BigtableClusterName;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 
 /**
  * An immutable class providing access to configuration options for Bigtable.
  */
-public class BigtableOptions {
+//TODO: Perhaps break this down into smaller options objects?
+public class BigtableOptions implements Serializable {
+
+  private static final long serialVersionUID = 1L;
 
   public static final String BIGTABLE_TABLE_ADMIN_HOST_DEFAULT =
       "bigtabletableadmin.googleapis.com";
   public static final String BIGTABLE_CLUSTER_ADMIN_HOST_DEFAULT =
       "bigtableclusteradmin.googleapis.com";
   public static final String BIGTABLE_DATA_HOST_DEFAULT = "bigtable.googleapis.com";
-  public static final int DEFAULT_BIGTABLE_PORT = 443;
+  public static final int BIGTABLE_PORT_DEFAULT = 443;
 
-  public static final int BIGTABLE_DATA_CHANNEL_COUNT_DEFAULT = 4;
+  public static final int BIGTABLE_DATA_CHANNEL_COUNT_DEFAULT = getDefaultDataChannelCount();
   public static final int BIGTABLE_CHANNEL_TIMEOUT_MS_DEFAULT =
       (int) TimeUnit.MILLISECONDS.convert(30, TimeUnit.MINUTES);
+  public static final int BIGTABLE_ASYNC_MUTATOR_COUNT_DEFAULT = 2;
+
+  /**
+   * This describes the maximum size a bulk mutation RPC should be before sending it to the server
+   * and starting the next bulk call. Defaults to 1 MB.
+   */
+  public static final long BIGTABLE_BULK_MAX_REQUEST_SIZE_BYTES_DEFAULT = 1 << 20;
+
+  /**
+   * This describes the maximum number of individual mutation requests to bundle in a single bulk
+   * mutation RPC before sending it to the server and starting the next bulk call.
+   * The server has a maximum of 100,000.  Since RPCs can be retried, we should limit the number of
+   * keys to 100 by default so we don't keep retrying larger batches.
+   */
+  public static final int BIGTABLE_BULK_MAX_ROW_KEY_COUNT_DEFAULT = 100;
 
   private static final Logger LOG = new Logger(BigtableOptions.class);
+
+  private static int getDefaultDataChannelCount() {
+    // 10 Channels seemed to work well on a 4 CPU machine, and this seems to scale well for higher
+    // CPU machines. Use no more than 250 Channels by default.
+    int availableProcessors = Runtime.getRuntime().availableProcessors();
+    return (int) Math.min(250, Math.max(1, Math.ceil(availableProcessors * 2.5d)));
+  }
 
   /**
    * A mutable builder for BigtableConnectionOptions.
    */
   public static class Builder {
-     // Configuration that a user is required to set.
+    // Configuration that a user is required to set.
     private String projectId;
     private String zoneId;
     private String clusterId;
@@ -54,8 +82,7 @@ public class BigtableOptions {
     private String dataHost = BIGTABLE_DATA_HOST_DEFAULT;
     private String tableAdminHost = BIGTABLE_TABLE_ADMIN_HOST_DEFAULT;
     private String clusterAdminHost = BIGTABLE_CLUSTER_ADMIN_HOST_DEFAULT;
-    private int port = DEFAULT_BIGTABLE_PORT;
-    private String overrideIp;
+    private int port = BIGTABLE_PORT_DEFAULT;
 
     // The default credentials get credential from well known locations, such as the GCE
     // metdata service or gcloud configuration in other environments. A user can also override
@@ -66,6 +93,33 @@ public class BigtableOptions {
     private RetryOptions retryOptions = new RetryOptions.Builder().build();
     private int timeoutMs = BIGTABLE_CHANNEL_TIMEOUT_MS_DEFAULT;
     private int dataChannelCount = BIGTABLE_DATA_CHANNEL_COUNT_DEFAULT;
+    private int asyncMutatorCount = BIGTABLE_ASYNC_MUTATOR_COUNT_DEFAULT;
+
+    private boolean useBulkApi = false;
+    private int bulkMaxRowKeyCount = BIGTABLE_BULK_MAX_ROW_KEY_COUNT_DEFAULT;
+    private long bulkMaxRequestSize = BIGTABLE_BULK_MAX_REQUEST_SIZE_BYTES_DEFAULT;
+
+    public Builder() {
+    }
+
+    private Builder(BigtableOptions original) {
+      this.projectId = original.projectId;
+      this.zoneId = original.zoneId;
+      this.clusterId = original.clusterId;
+      this.userAgent = original.userAgent;
+      this.dataHost = original.dataHost;
+      this.tableAdminHost = original.tableAdminHost;
+      this.clusterAdminHost = original.clusterAdminHost;
+      this.port = original.port;
+      this.credentialOptions = original.credentialOptions;
+      this.retryOptions = original.retryOptions;
+      this.timeoutMs = original.timeoutMs;
+      this.dataChannelCount = original.dataChannelCount;
+      this.asyncMutatorCount = original.asyncMutatorCount;
+      this.useBulkApi = original.useBulkApi;
+      this.bulkMaxRowKeyCount = original.bulkMaxRowKeyCount;
+      this.bulkMaxRequestSize = original.bulkMaxRequestSize;
+    }
 
     public Builder setTableAdminHost(String tableAdminHost) {
       this.tableAdminHost = tableAdminHost;
@@ -79,15 +133,6 @@ public class BigtableOptions {
 
     public Builder setDataHost(String dataHost) {
       this.dataHost = dataHost;
-      return this;
-    }
-
-    /**
-     * Override IP the for all *Hosts.  This is used for Cloud Bigtable to point to a developer's
-     * Cloud Bigtable server.
-     */
-    public Builder setOverrideIp(String overrideIp) {
-      this.overrideIp = overrideIp;
       return this;
     }
 
@@ -136,12 +181,37 @@ public class BigtableOptions {
       return this;
     }
 
+    public Builder setAsyncMutatorWorkerCount(int asyncMutatorCount) {
+      Preconditions.checkArgument(
+          asyncMutatorCount >= 0, "asyncMutatorCount must be greater or equal to 0.");
+      this.asyncMutatorCount = asyncMutatorCount;
+      return this;
+    }
+
+    public Builder setUseBulkApi(boolean useBulkApi) {
+      this.useBulkApi = useBulkApi;
+      return this;
+    }
+
+    public Builder setBulkMaxRowKeyCount(int bulkMaxRowKeyCount) {
+      Preconditions.checkArgument(
+        bulkMaxRowKeyCount >= 0, "bulkMaxRowKeyCount must be greater or equal to 0.");
+      this.bulkMaxRowKeyCount = bulkMaxRowKeyCount;
+      return this;
+    }
+
+    public Builder setBulkMaxRequestSize(long bulkMaxRequestSize) {
+      Preconditions.checkArgument(
+        bulkMaxRequestSize >= 0, "bulkMaxRequestSize must be greater or equal to 0.");
+      this.bulkMaxRequestSize = bulkMaxRequestSize;
+      return this;
+    }
+
     public BigtableOptions build() {
       return new BigtableOptions(
           clusterAdminHost,
           tableAdminHost,
           dataHost,
-          overrideIp,
           port,
           projectId,
           zoneId,
@@ -150,14 +220,17 @@ public class BigtableOptions {
           userAgent,
           retryOptions,
           timeoutMs,
-          dataChannelCount);
+          dataChannelCount,
+          asyncMutatorCount,
+          useBulkApi,
+          bulkMaxRowKeyCount,
+          bulkMaxRequestSize);
     }
   }
 
   private final String clusterAdminHost;
   private final String tableAdminHost;
   private final String dataHost;
-  private final String overrideIp;
   private final int port;
   private final String projectId;
   private final String zoneId;
@@ -166,15 +239,19 @@ public class BigtableOptions {
   private final String userAgent;
   private final RetryOptions retryOptions;
   private final int timeoutMs;
-  private final int channelCount;
+  private final int dataChannelCount;
   private final BigtableClusterName clusterName;
+  private final int asyncMutatorCount;
+  private final boolean useBulkApi;
+  private final int bulkMaxRowKeyCount;
+  private final long bulkMaxRequestSize;
+
 
   @VisibleForTesting
   BigtableOptions() {
       clusterAdminHost = null;
       tableAdminHost = null;
       dataHost = null;
-      overrideIp = null;
       port = 0;
       projectId = null;
       zoneId = null;
@@ -183,15 +260,18 @@ public class BigtableOptions {
       userAgent = null;
       retryOptions = null;
       timeoutMs = 0;
-      channelCount = 1;
+      dataChannelCount = 1;
       clusterName = null;
+      asyncMutatorCount = 1;
+      useBulkApi = false;
+      bulkMaxRowKeyCount = -1;
+      bulkMaxRequestSize = -1;
   }
 
   private BigtableOptions(
       String clusterAdminHost,
       String tableAdminHost,
       String dataHost,
-      String overrideIp,
       int port,
       String projectId,
       String zoneId,
@@ -200,15 +280,11 @@ public class BigtableOptions {
       String userAgent,
       RetryOptions retryOptions,
       int timeoutMs,
-      int channelCount) {
-    Preconditions.checkArgument(
-        !Strings.isNullOrEmpty(projectId), "ProjectId must not be empty or null.");
-    Preconditions.checkArgument(
-        !Strings.isNullOrEmpty(zoneId), "ZoneId must not be empty or null.");
-    Preconditions.checkArgument(
-        !Strings.isNullOrEmpty(clusterId), "ClusterId must not be empty or null.");
-    Preconditions.checkArgument(!Strings.isNullOrEmpty(userAgent),
-        "UserAgent must not be empty or null");
+      int channelCount,
+      int asyncMutatorCount,
+      boolean useBulkApi,
+      int bulkMaxKeyCount,
+      long bulkMaxRequestSize) {
     Preconditions.checkArgument(channelCount > 0, "Channel count has to be at least 1.");
     Preconditions.checkArgument(timeoutMs >= -1,
       "ChannelTimeoutMs has to be positive, or -1 for none.");
@@ -216,7 +292,6 @@ public class BigtableOptions {
     this.tableAdminHost = Preconditions.checkNotNull(tableAdminHost);
     this.clusterAdminHost = Preconditions.checkNotNull(clusterAdminHost);
     this.dataHost = Preconditions.checkNotNull(dataHost);
-    this.overrideIp = overrideIp;
     this.port = port;
     this.projectId = projectId;
     this.zoneId = zoneId;
@@ -225,8 +300,19 @@ public class BigtableOptions {
     this.userAgent = userAgent;
     this.retryOptions = retryOptions;
     this.timeoutMs = timeoutMs;
-    this.channelCount = channelCount;
-    this.clusterName = new BigtableClusterName(getProjectId(), getZoneId(), getClusterId());
+    this.dataChannelCount = channelCount;
+    this.asyncMutatorCount = asyncMutatorCount;
+    this.useBulkApi = useBulkApi;
+    this.bulkMaxRowKeyCount = bulkMaxKeyCount;
+    this.bulkMaxRequestSize = bulkMaxRequestSize;
+
+    if (!Strings.isNullOrEmpty(projectId)
+        && !Strings.isNullOrEmpty(zoneId)
+        && !Strings.isNullOrEmpty(clusterId)) {
+      this.clusterName = new BigtableClusterName(getProjectId(), getZoneId(), getClusterId());
+    } else {
+      this.clusterName = null;
+    }
 
     LOG.debug("Connection Configuration: projectId: %s, zoneId: %s, clusterId: %s, data host %s, "
         + "table admin host %s, cluster admin host %s.",
@@ -262,14 +348,6 @@ public class BigtableOptions {
     return clusterAdminHost;
   }
 
-  /**
-   * Returns an override IP for all *Hosts.  This is used for Cloud Bigtable to point to a
-   * developer's Cloud Bigtable server.
-   */
-  public String getOverrideIp() {
-    return overrideIp;
-  }
-
   public int getPort() {
     return port;
   }
@@ -293,7 +371,9 @@ public class BigtableOptions {
   /**
    * Options controlling retries.
    */
-  public RetryOptions getRetryOptions() { return retryOptions; }
+  public RetryOptions getRetryOptions() {
+    return retryOptions;
+  }
 
   /**
    * The timeout for a channel.
@@ -303,13 +383,82 @@ public class BigtableOptions {
   }
 
   /**
-   * The number of channels to create.
+   * The number of data channels to create.
    */
   public int getChannelCount() {
-    return channelCount;
+    return dataChannelCount;
   }
 
   public BigtableClusterName getClusterName() {
     return clusterName;
+  }
+
+  public int getAsyncMutatorCount() {
+    return asyncMutatorCount;
+  }
+
+  public boolean useBulkApi() {
+    return useBulkApi;
+  }
+
+  public int getBulkMaxRowKeyCount() {
+    return bulkMaxRowKeyCount;
+  }
+
+  public long getBulkMaxRequestSize() {
+    return bulkMaxRequestSize;
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+    if (obj == null || obj.getClass() != BigtableOptions.class) {
+      return false;
+    }
+    if (obj == this) {
+      return true;
+    }
+    BigtableOptions other = (BigtableOptions) obj;
+    return (port == other.port)
+        && (timeoutMs == other.timeoutMs)
+        && (dataChannelCount == other.dataChannelCount)
+        && (asyncMutatorCount == other.asyncMutatorCount)
+        && (useBulkApi == other.useBulkApi)
+        && (bulkMaxRowKeyCount == other.bulkMaxRowKeyCount)
+        && (bulkMaxRequestSize == other.bulkMaxRequestSize)
+        && Objects.equal(clusterAdminHost, other.clusterAdminHost)
+        && Objects.equal(tableAdminHost, other.tableAdminHost)
+        && Objects.equal(dataHost, other.dataHost)
+        && Objects.equal(projectId, other.projectId)
+        && Objects.equal(zoneId, other.zoneId)
+        && Objects.equal(clusterId, other.clusterId)
+        && Objects.equal(userAgent, other.userAgent)
+        && Objects.equal(credentialOptions, other.credentialOptions)
+        && Objects.equal(retryOptions, other.retryOptions);
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .omitNullValues()
+        .add("dataHost", dataHost)
+        .add("tableAdminHost", tableAdminHost)
+        .add("clusterAdminHost", clusterAdminHost)
+        .add("projectId", projectId)
+        .add("zoneId", zoneId)
+        .add("clusterId", clusterId)
+        .add("userAgent", userAgent)
+        .add("credentialType", credentialOptions.getCredentialType())
+        .add("port", port)
+        .add("timeoutMs", timeoutMs)
+        .add("dataChannelCount", dataChannelCount)
+        .add("asyncMutatorCount", asyncMutatorCount)
+        .add("useBulkApi", useBulkApi)
+        .add("bulkMaxKeyCount", bulkMaxRowKeyCount)
+        .add("bulkMaxRequestSize", bulkMaxRequestSize)
+        .toString();
+  }
+
+  public Builder toBuilder() {
+    return new Builder(this);
   }
 }
